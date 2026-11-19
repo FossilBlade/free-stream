@@ -95,9 +95,21 @@ npm run docker:up        # = docker compose up -d --build
 
 This starts FreeStream and Prowlarr. Both restart automatically whenever Docker starts.
 
-1. **Prowlarr:** open http://localhost:9696, add indexers, and copy the API key (Settings → General).
+1. **Prowlarr:** open http://localhost:9696, add indexers (see [Starting indexers](#starting-indexers)), and copy the API key (Settings → General).
 2. **FreeStream:** open `http://<this computer's IP>:8080`; on a Mac, `ipconfig getifaddr en0` prints the IP. In **Settings**, add the TMDB key and the Prowlarr API key, set the Prowlarr URL to **`http://prowlarr:9696`** (the container name, not localhost), and press **Test connection**.
 3. **Optional AI:** install Ollama on the host, run `ollama pull gemma4:e2b`, and keep `ollama serve` running. The container reaches it at `host.docker.internal:11434`.
+
+### Starting indexers
+
+These public indexers need no account and work well together. In Prowlarr, go to **Indexers → Add Indexer**, search for each name, and save it with the default settings:
+
+| Indexer | Good for |
+| --- | --- |
+| **YTS** | Movies: small, good-quality H.264 encodes that play almost everywhere. |
+| **The Pirate Bay** | Movies and shows; the widest selection, including Indian releases. |
+| **LimeTorrents** | Movies and shows; a useful second source for shows. |
+
+Skip **Internet Archive**. It mostly times out, and its results are rarely full films. (FreeStream gives each indexer 25 seconds and carries on without slow ones, but that makes every search take the full 25 seconds.) Indexers behind Cloudflare, such as 1337x, need FlareSolverr (see below).
 
 Also good to know:
 - **State** lives in `./data` (Prowlarr's config in `./data/prowlarr`). Downloads go to `~/Movies/FreeStream`.
@@ -113,7 +125,7 @@ cp .env.example .env   # optional: everything can also be set on the Settings pa
 npm start              # builds the web app, starts the server, keeps the Mac awake
 ```
 
-Install Prowlarr or Jackett yourself and use `http://localhost:9696` (Prowlarr) or `http://localhost:9117` (Jackett) as the indexer URL. If macOS asks whether `node` may accept incoming connections, click **Allow**, or other devices can't reach it.
+Install Prowlarr or Jackett yourself, add the [starting indexers](#starting-indexers), and use `http://localhost:9696` (Prowlarr) or `http://localhost:9117` (Jackett) as the indexer URL. If macOS asks whether `node` may accept incoming connections, click **Allow**, or other devices can't reach it.
 
 ## Watching on an LG TV
 
