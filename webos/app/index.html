@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>FreeStream</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #04161a; color: #e9f4f2; font-family: sans-serif; }
+      .wrap { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+      .logo { font-size: 72px; font-weight: 800; letter-spacing: -1px; }
+      .logo span { color: #2ec4b6; }
+      .logo i { display: inline-block; width: 0; height: 0; border-top: 26px solid transparent; border-bottom: 26px solid transparent; border-left: 40px solid #ffb547; margin-right: 20px; }
+      p { font-size: 30px; color: #86aaa5; margin: 30px 0 0; max-width: 1200px; line-height: 1.4; }
+      .err { color: #ffb547; }
+      .btn { display: inline-block; margin-top: 40px; padding: 18px 44px; border-radius: 12px; background: #ffb547; color: #1a1204; font-size: 30px; font-weight: 700; }
+      .hidden { display: none; }
+      .spinner { width: 70px; height: 70px; margin-top: 50px; border-radius: 50%; border: 8px solid rgba(46,196,182,.2); border-top-color: #2ec4b6; animation: s .9s linear infinite; }
+      @keyframes s { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="logo"><i></i>Free<span>Stream</span></div>
+      <div id="spin" class="spinner"></div>
+      <p id="msg">Connecting to your Mac…</p>
+      <div id="retry" class="btn hidden">Try again</div>
+    </div>
+    <script src="config.js"></script>
+    <script>
+      // Launcher: checks the FreeStream server on the Mac is up, then opens it full screen.
+      var url = (window.FREESTREAM_URL || '').replace(/\/+$/, '');
+      var msg = document.getElementById('msg');
+      var spin = document.getElementById('spin');
+      var retry = document.getElementById('retry');
+
+      function fail(text) {
+        spin.className = 'hidden';
+        msg.className = 'err';
+        msg.innerHTML = text;
+        retry.className = 'btn';
+      }
+
+      function connect() {
+        spin.className = 'spinner';
+        msg.className = '';
+        msg.textContent = 'Connecting to ' + url + '…';
+        retry.className = 'btn hidden';
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url + '/api/status');
+        xhr.timeout = 6000;
+        xhr.onload = function () {
+          if (xhr.status === 200) window.location.replace(url + '/');
+          else fail('The server at ' + url + ' answered with an error (' + xhr.status + ').');
+        };
+        xhr.onerror = xhr.ontimeout = function () {
+          fail("Can't reach FreeStream at " + url + '.<br>Make sure the Mac is awake and <b>npm start</b> is running in the free-stream folder.');
+        };
+        xhr.send();
+      }
+
+      document.addEventListener('keydown', function (e) {
+        if (e.keyCode === 13 && retry.className === 'btn') connect();
+      });
+      retry.addEventListener('click', connect);
+
+      if (!url) fail('No server address set. Rebuild the app with: npm run webos:package');
+      else connect();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "name": "free-stream",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c cyan,yellow \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web",
+    "start": "npm run build && caffeinate -i npm run start -w server",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
+    "webos:package": "./webos/package.sh",
+    "webos:install": "./webos/install.sh",
+    "docker:up": "docker compose up -d --build && echo \"FreeStream: http://$(ipconfig getifaddr en0):${PORT:-8080}  Prowlarr: http://localhost:9696\"",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f freestream"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.5"
+  }
+}

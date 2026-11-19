@@ -1,0 +1,14 @@
+{
+  "id": "com.freestream.tv",
+  "version": "1.0.0",
+  "vendor": "FreeStream",
+  "type": "web",
+  "main": "index.html",
+  "title": "FreeStream",
+  "icon": "icon.png",
+  "largeIcon": "largeIcon.png",
+  "bgColor": "#04161a",
+  "iconColor": "#04161a",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true
+}

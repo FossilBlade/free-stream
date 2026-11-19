@@ -1,0 +1,552 @@
+import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
+import { Bell, BellRing, CalendarClock, Check, CheckCircle2, Clapperboard, Download, Link2, ListPlus, Play, Sparkles, Star, ThumbsDown } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { api, ApiError, downloadMessage, formatRuntime, img, shortDate, todayIso, type Card, type Details, type DownloadRow, type Episode, type MediaType, type Progress, type SavedSource, type Verdict, type Watch } from '../api';
+import { FocusGroup, Focusable } from '../components/Focusable';
+import { MagnetModal } from '../components/MagnetModal';
+import { Row, TitleCard } from '../components/Row';
+import { Sources, type PickMode } from '../components/Sources';
+import { toast } from '../components/Toast';
+import { VerdictCard } from '../components/VerdictCard';
+import { Button, hideBroken, ProgressBar, Spinner } from '../components/ui';
+import { SetupNeeded } from './Home';
+import { useProfile } from '../profile';
+
+interface Target {
+  season?: number;
+  episode?: number;
+}
+
+export function Title() {
+  const { type: typeParam, id: idParam } = useParams();
+  const type = (typeParam === 'tv' ? 'tv' : 'movie') as MediaType;
+  const id = Number(idParam);
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+
+  const [details, setDetails] = useState<Details | null>(null);
+  const [inList, setInList] = useState(false);
+  const [lastWatched, setLastWatched] = useState<Progress | null>(null);
+  const [movieSource, setMovieSource] = useState<SavedSource | null>(null);
+  const [loadError, setLoadError] = useState<ApiError | null>(null);
+
+  const [season, setSeason] = useState<number | null>(null);
+  const [episodes, setEpisodes] = useState<Episode[] | null>(null);
+  const [seasonSource, setSeasonSource] = useState<SavedSource | null>(null);
+  /** Downloads of this title (movie) or of the selected season (show). */
+  const [downloads, setDownloads] = useState<DownloadRow[]>([]);
+
+  const [watch, setWatch] = useState<Watch | null>(null);
+  const [upgrade, setUpgrade] = useState<Watch | null>(null);
+  const [sourceVerdict, setSourceVerdict] = useState<Verdict | null>(null);
+  const [showVerdict, setShowVerdict] = useState(false);
+  const [ageRating, setAgeRating] = useState<number | null>(null);
+  const [because, setBecause] = useState<string | null>(null);
+  const [similar, setSimilar] = useState<Card[]>([]);
+  const { isKid } = useProfile();
+
+  /** The source list, open for a movie/episode, to either play or download. */
+  const [picking, setPicking] = useState<(Target & { mode: PickMode; theater?: boolean }) | null>(null);
+  const [showMagnet, setShowMagnet] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const sourcesRef = useRef<HTMLDivElement>(null);
+  const autoPlayed = useRef(false);
+
+  useEffect(() => {
+    setDetails(null);
+    setPicking(null);
+    api
+      .title(type, id)
+      .then((r) => {
+        setDetails(r.details);
+        setInList(r.inMyList);
+        setLastWatched(r.lastWatched);
+        setMovieSource(r.savedSource);
+        setWatch(r.watch);
+        setUpgrade(r.upgrade);
+        setSourceVerdict(r.sourceVerdict);
+        setAgeRating(r.ageRating);
+        setBecause(r.suggestedBecause);
+        if (type === 'movie') setDownloads(r.downloads);
+        if (type === 'tv') setSeason(r.lastWatched?.season ?? r.details.seasons[0]?.number ?? 1);
+      })
+      .catch(setLoadError);
+    setSimilar([]);
+    api
+      .similar(type, id)
+      .then((r) => setSimilar(r.results))
+      .catch(() => {});
+  }, [type, id]);
+
+  const notInterested = () => {
+    api
+      .notInterested(type, id)
+      .then(() => {
+        setBecause(null);
+        toast('Got it — we won’t suggest this again.');
+        setTimeout(() => setFocus('title-play'), 50);
+      })
+      .catch((e: ApiError) => toast(e.message, 'error'));
+  };
+
+  const loadSeason = useCallback(
+    (n: number, quiet = false) => {
+      if (!quiet) setEpisodes(null);
+      return api
+        .season(id, n)
+        .then((r) => {
+          setEpisodes(r.episodes);
+          setSeasonSource(r.savedSource);
+          setDownloads(r.downloads);
+        })
+        .catch(() => !quiet && setEpisodes([]));
+    },
+    [id],
+  );
+
+  useEffect(() => {
+    if (type === 'tv' && season != null) loadSeason(season);
+  }, [type, season, loadSeason]);
+
+  /** Re-reads download state (after starting one, and while any is in progress). */
+  const refreshDownloads = useCallback(() => {
+    if (type === 'tv') {
+      if (season != null) loadSeason(season, true);
+    } else {
+      api
+        .downloads({ type, id })
+        .then((r) => setDownloads(r.downloads))
+        .catch(() => {});
+    }
+  }, [type, id, season, loadSeason]);
+
+  const anyDownloading = downloads.some((d) => d.downloading);
+  useEffect(() => {
+    if (!anyDownloading) return;
+    const t = setInterval(refreshDownloads, 4000);
+    return () => clearInterval(t);
+  }, [anyDownloading, refreshDownloads]);
+
+  // Movie downloads: a finished copy (the explicitly downloaded one first), or one in progress.
+  const completeDl = type === 'movie' ? downloads.filter((d) => d.complete && d.fileIdx != null).sort((a, b) => Number(b.requested) - Number(a.requested))[0] : undefined;
+  const activeDl = type === 'movie' ? downloads.find((d) => d.downloading) : undefined;
+
+  useEffect(() => {
+    if (details) setTimeout(() => setFocus('title-play'), 50);
+  }, [details]);
+
+  // Warm up the remembered source while the page is open, so Play starts faster (no-op if there isn't one).
+  useEffect(() => {
+    if (!details) return;
+    const s = type === 'tv' ? (lastWatched?.season ?? details.seasons[0]?.number) : undefined;
+    api.prewarm({ mediaType: type, tmdbId: id, season: s }).catch(() => {});
+    // once per page visit
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [details]);
+
+  /** The movie, or for a show the episode Play would start (resume point, else S1E1). */
+  const mainTarget = useCallback((): Target => {
+    if (type === 'movie' || !details) return {};
+    return lastWatched?.season != null ? { season: lastWatched.season, episode: lastWatched.episode ?? 1 } : { season: details.seasons[0]?.number ?? 1, episode: 1 };
+  }, [type, details, lastWatched]);
+
+  const openPicker = useCallback((t: Target, mode: PickMode, theater = false) => {
+    setPicking({ ...t, mode, theater });
+    if (t.season != null) setSeason(t.season);
+    // Sources focuses its own list once the search finishes.
+    setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+  }, []);
+
+  const play = useCallback(
+    async (t: Target, source?: SavedSource) => {
+      if (!details) return;
+      setBusy(true);
+      try {
+        const info = await api.play({ mediaType: type, tmdbId: id, season: t.season, episode: t.episode, source });
+        const q = type === 'tv' ? `?season=${t.season}&episode=${t.episode}` : '';
+        navigate(`/watch/${type}/${id}${q}`, { state: { play: info } });
+      } catch (e) {
+        const err = e as ApiError;
+        // Kids never see source lists: just say what happened.
+        if (isKid) return void toast(err.message, 'error');
+        // No source yet / not in this season pack: just show the list. Real failures get a short note too.
+        if (err.status !== 409 && err.status !== 422) toast(err.message, 'error');
+        openPicker(t, 'play');
+      } finally {
+        setBusy(false);
+      }
+    },
+    [details, type, id, navigate, openPicker, isKid],
+  );
+
+  /** Plays an episode: from its finished download if there is one, else the season's source (or pick one). */
+  const playEpisode = useCallback(
+    (n: number, e: number) => {
+      if (isKid) return void play({ season: n, episode: e }); // the server picks a verified source
+      const ep = n === season ? episodes?.find((x) => x.number === e) : undefined;
+      if (ep?.download?.complete) play({ season: n, episode: e }, { infoHash: ep.download.infoHash, releaseTitle: 'Downloaded file' });
+      else if (n !== season || seasonSource) play({ season: n, episode: e });
+      else openPicker({ season: n, episode: e }, 'play');
+    },
+    [season, episodes, seasonSource, play, openPicker, isKid],
+  );
+
+  /** Play: a finished download first, then the remembered source, else pick one. */
+  const playMain = useCallback(() => {
+    if (!details) return;
+    if (isKid && type === 'movie') return void play({});
+    if (type === 'movie') {
+      const sourceIsDownloaded = !!movieSource && downloads.some((d) => d.complete && d.infoHash === movieSource.infoHash);
+      if (completeDl && !sourceIsDownloaded) play({}, { infoHash: completeDl.infoHash, releaseTitle: completeDl.releaseName });
+      else if (movieSource) play({});
+      else openPicker({}, 'play');
+      return;
+    }
+    const t = mainTarget();
+    playEpisode(t.season!, t.episode!);
+  }, [details, type, movieSource, downloads, completeDl, mainTarget, play, playEpisode, openPicker, isKid]);
+
+  // "Play" from the home banner lands here with ?play=1; the player sends ?pick=1 when a source is needed.
+  useEffect(() => {
+    if (!details || autoPlayed.current) return;
+    if (params.get('play')) {
+      autoPlayed.current = true;
+      playMain();
+    } else if (params.get('pick')) {
+      autoPlayed.current = true;
+      const s = params.get('season');
+      const e = params.get('episode');
+      openPicker(s ? { season: Number(s), episode: Number(e) || 1 } : {}, 'play');
+    }
+  }, [details, params, playMain, openPicker]);
+
+  /** Download: uses the remembered source (or the given one); otherwise opens the list to pick one. */
+  const download = async (t: Target, source?: SavedSource) => {
+    try {
+      const r = await api.download({ mediaType: type, tmdbId: id, season: t.season, episode: t.episode, source });
+      toast(downloadMessage(r));
+      refreshDownloads();
+    } catch (e) {
+      const err = e as ApiError;
+      if (err.status === 409 || err.status === 422) openPicker(t, 'download');
+      else toast(err.message, 'error');
+    }
+  };
+
+  /** Notify me: watch for a proper release in the background. */
+  const toggleWatch = async () => {
+    try {
+      if (watch) {
+        await api.unwatch(watch.key);
+        setWatch(null);
+        toast('Stopped watching for this title.');
+      } else {
+        const w = await api.watch({ mediaType: type, tmdbId: id });
+        setWatch(w);
+        toast('We’ll look for a proper release and show it under Watching (🔔).');
+      }
+    } catch (e) {
+      toast((e as ApiError).message, 'error');
+    }
+  };
+
+  const dismissUpgrade = () => {
+    if (upgrade) api.watchSeen(upgrade.key).catch(() => {});
+    setUpgrade(null);
+  };
+
+  const toggleList = async () => {
+    if (!details) return;
+    if (inList) await api.removeFromList(type, id);
+    else await api.addToList({ mediaType: type, tmdbId: id, title: details.title, posterPath: details.posterPath, backdropPath: details.backdropPath });
+    setInList(!inList);
+  };
+
+  const startOver = async () => {
+    await api.clearProgress(type, id);
+    setLastWatched(null);
+    if (type === 'movie') playMain();
+    else playEpisode(details?.seasons[0]?.number ?? 1, 1);
+  };
+
+  const changeSource = async () => {
+    const t = mainTarget();
+    await api.forgetSource(type, id, t.season);
+    if (type === 'movie') setMovieSource(null);
+    else setSeasonSource(null);
+    openPicker(t, 'play');
+  };
+
+  if (loadError) return <SetupNeeded error={loadError} />;
+  if (!details) return <Spinner />;
+
+  const resuming = !!lastWatched && lastWatched.position > 30;
+  const target = mainTarget();
+  const playLabel =
+    type === 'tv'
+      ? `${resuming ? 'Resume' : 'Play'} S${target.season}:E${target.episode}`
+      : resuming
+        ? `Resume · ${Math.max(1, Math.round((lastWatched!.duration - lastWatched!.position) / 60))}m left`
+        : 'Play';
+
+  const currentSource = type === 'movie' ? movieSource : seasonSource;
+  const release = details.release;
+  /** Something to play already: a source or a finished download. */
+  const hasCopy = !!(currentSource || completeDl);
+  const pickingEpisode = picking?.episode != null ? episodes?.find((e) => e.number === picking.episode) : undefined;
+  const pickerSubtitle = picking && type === 'tv' ? `Season ${picking.season} · Episode ${picking.episode}${pickingEpisode ? ` · ${pickingEpisode.name}` : ''}` : undefined;
+
+  return (
+    <div className="page page-detail">
+      <section className="detail-hero">
+        <div className="hero-bg" style={{ backgroundImage: `url(${img(details.backdropPath, 'w1280')})` }} />
+        <div className="hero-shade" />
+        <div className="hero-content">
+          {details.logoPath ? <img className="title-logo" src={img(details.logoPath, 'w500')} alt={details.title} /> : <h1 className="hero-title">{details.title}</h1>}
+          <div className="meta-line">
+            {details.rating > 0 && (
+              <span className="rating">
+                <Star /> {details.rating.toFixed(1)}
+              </span>
+            )}
+            <span>{details.year}</span>
+            {ageRating != null && <span className="age-chip">{ageRating === 0 ? 'All ages' : `${ageRating}+`}</span>}
+            {type === 'tv' ? <span>{details.seasons.length} Season{details.seasons.length === 1 ? '' : 's'}</span> : <span>{formatRuntime(details.runtime)}</span>}
+            {details.genres.slice(0, 3).map((g) => (
+              <span key={g}>{g}</span>
+            ))}
+          </div>
+          {details.tagline && <p className="tagline">{details.tagline}</p>}
+          <p className="hero-overview">{details.overview}</p>
+          {details.cast.length > 0 && <p className="muted small">Starring {details.cast.join(', ')}</p>}
+          {because && (
+            <FocusGroup focusKey="title-because" className="suggest-reason small">
+              <Sparkles className="inline-icon" />
+              <span>Suggested for you: {because}</span>
+              {!isKid && (
+                <Focusable className="link-btn" scroll="top" onSelect={notInterested}>
+                  <ThumbsDown className="inline-icon" /> Not interested
+                </Focusable>
+              )}
+            </FocusGroup>
+          )}
+          {release.state === 'coming' && (
+            <div className="release-pill">
+              <CalendarClock /> Coming {release.expected ? shortDate(release.expected) : 'soon'}
+            </div>
+          )}
+          {release.state === 'theaters' && (
+            <div className="release-pill is-theaters">
+              <Clapperboard /> In theaters · {release.expected ? `digital release expected ${shortDate(release.expected)}` : 'digital release date not announced'}
+            </div>
+          )}
+
+          {isKid ? (
+            <FocusGroup focusKey="title-actions" className="actions">
+              {release.state === 'available' && (
+                <Button focusKey="title-play" variant="primary" icon={<Play />} scroll="top" disabled={busy} onSelect={playMain}>
+                  {busy ? 'Getting it ready…' : playLabel}
+                </Button>
+              )}
+              <Button focusKey={release.state === 'available' ? undefined : 'title-play'} icon={inList ? <Check /> : <ListPlus />} scroll="top" onSelect={toggleList}>
+                My List
+              </Button>
+            </FocusGroup>
+          ) : (
+          <FocusGroup focusKey="title-actions" className="actions">
+            {release.state !== 'coming' &&
+              (release.state === 'theaters' && !hasCopy ? (
+                <Button focusKey="title-play" variant="primary" icon={<Clapperboard />} scroll="top" disabled={busy} onSelect={() => openPicker({}, 'play', true)}>
+                  Watch theater copy
+                </Button>
+              ) : (
+                <Button focusKey="title-play" variant="primary" icon={<Play />} scroll="top" disabled={busy} onSelect={playMain}>
+                  {busy ? 'Starting…' : playLabel}
+                </Button>
+              ))}
+            {release.state !== 'coming' &&
+              (release.state !== 'theaters' || hasCopy) &&
+              (completeDl ? (
+                <Button icon={<CheckCircle2 />} scroll="top" className="btn-done" onSelect={() => navigate('/downloads')}>
+                  Downloaded
+                </Button>
+              ) : activeDl ? (
+                <Button icon={<Download />} scroll="top" className="btn-progress" onSelect={() => navigate('/downloads')}>
+                  Downloading {Math.floor(activeDl.progress * 100)}%
+                </Button>
+              ) : (
+                <Button icon={<Download />} scroll="top" onSelect={() => download(target)}>
+                  Download
+                </Button>
+              ))}
+            {release.state !== 'available' && (
+              <Button focusKey={release.state === 'coming' ? 'title-play' : undefined} icon={watch ? <BellRing /> : <Bell />} scroll="top" className={watch ? 'btn-done' : ''} onSelect={toggleWatch}>
+                {watch ? 'Notifying' : release.state === 'theaters' ? 'Notify when out' : 'Notify me'}
+              </Button>
+            )}
+            <Button icon={inList ? <Check /> : <ListPlus />} scroll="top" onSelect={toggleList}>
+              My List
+            </Button>
+            <Button icon={<Link2 />} scroll="top" onSelect={() => setShowMagnet(true)}>
+              Magnet link
+            </Button>
+          </FocusGroup>
+          )}
+
+          {!isKid && upgrade?.found && (
+            <div className="upgrade-banner">
+              <div>
+                <strong>
+                  <Sparkles className="inline-icon" /> Better version found
+                </strong>
+                <span className="muted small">{upgrade.found.label}</span>
+              </div>
+              <FocusGroup focusKey="upgrade" className="actions actions-tight">
+                <Button variant="primary" icon={<Play />} onSelect={() => play({ season: upgrade.season, episode: upgrade.episode }, upgrade.found!.source)}>
+                  Play it
+                </Button>
+                <Button icon={<Download />} onSelect={() => download({ season: upgrade.season, episode: upgrade.episode }, upgrade.found!.source)}>
+                  Download
+                </Button>
+                <Button variant="ghost" onSelect={dismissUpgrade}>
+                  Not now
+                </Button>
+              </FocusGroup>
+            </div>
+          )}
+
+          {!isKid && (completeDl || currentSource || resuming || sourceVerdict) && (
+            <FocusGroup focusKey="title-links" className="title-links muted small">
+              {completeDl ? (
+                <span>✓ On this Mac{sourceVerdict ? ` · ${sourceVerdict.label}` : ''}</span>
+              ) : currentSource ? (
+                <span className="source-note">Source: {sourceVerdict ? sourceVerdict.label : currentSource.releaseTitle}</span>
+              ) : null}
+              {sourceVerdict && (
+                <Focusable className="link-btn" scroll="top" onSelect={() => setShowVerdict((v) => !v)}>
+                  {showVerdict ? 'Hide details' : 'Details'}
+                </Focusable>
+              )}
+              {currentSource && (
+                <Focusable className="link-btn" scroll="top" onSelect={changeSource}>
+                  Change source
+                </Focusable>
+              )}
+              {resuming && (
+                <Focusable className="link-btn" scroll="top" onSelect={startOver}>
+                  Start over
+                </Focusable>
+              )}
+            </FocusGroup>
+          )}
+          {showVerdict && sourceVerdict && <VerdictCard v={sourceVerdict} />}
+        </div>
+      </section>
+
+      {type === 'tv' && (
+        <section className="episodes-section">
+          <FocusGroup focusKey="seasons" className="chips seasons">
+            {details.seasons.map((s) => (
+              <Focusable key={s.number} className={`chip${season === s.number ? ' is-active' : ''}`} onSelect={() => setSeason(s.number)}>
+                {s.name}
+              </Focusable>
+            ))}
+          </FocusGroup>
+          {!episodes ? (
+            <Spinner />
+          ) : (
+            <FocusGroup focusKey="episodes" className="episode-list">
+              {episodes.map((e) => (
+                <div className="episode-row" key={e.number}>
+                  <Focusable className="episode" disabled={busy} onSelect={() => playEpisode(season!, e.number)}>
+                    <div className="episode-num">{e.number}</div>
+                    <div className="episode-still">
+                      {e.stillPath ? <img src={img(e.stillPath, 'w300')} alt="" loading="lazy" onError={hideBroken} /> : <div className="card-fallback" />}
+                      <div className="card-play">
+                        <Play />
+                      </div>
+                      {e.progress > 0 && <ProgressBar value={e.progress} />}
+                    </div>
+                    <div className="episode-body">
+                      <div className="episode-head">
+                        <h3>{e.name}</h3>
+                        {e.airDate && e.airDate > todayIso() ? <span className="accent">Airs {shortDate(e.airDate)}</span> : <span className="muted">{formatRuntime(e.runtime)}</span>}
+                      </div>
+                      <p className="muted">{e.overview}</p>
+                    </div>
+                  </Focusable>
+                  {isKid ? null : e.download?.complete ? (
+                    <Focusable className="btn btn-secondary btn-icon episode-download is-done" disabled={busy} title="On this Mac — play it" onSelect={() => playEpisode(season!, e.number)}>
+                      <CheckCircle2 />
+                    </Focusable>
+                  ) : e.download?.downloading ? (
+                    <Focusable className="btn btn-secondary episode-download is-progress" title="Downloading" onSelect={() => navigate('/downloads')}>
+                      {Math.floor(e.download.progress * 100)}%
+                    </Focusable>
+                  ) : (
+                    <Focusable className="btn btn-secondary btn-icon episode-download" disabled={busy} title="Download episode" onSelect={() => download({ season: season!, episode: e.number })}>
+                      <Download />
+                    </Focusable>
+                  )}
+                </div>
+              ))}
+            </FocusGroup>
+          )}
+        </section>
+      )}
+
+      <div ref={sourcesRef}>
+        {picking && !isKid && (
+          <Sources
+            key={`${picking.mode}-${picking.season}-${picking.episode}`}
+            mediaType={type}
+            tmdbId={id}
+            title={details.title}
+            year={details.year}
+            season={picking.season}
+            episode={picking.episode}
+            mode={picking.mode}
+            subtitle={pickerSubtitle}
+            theaterFocus={picking.theater || release.state === 'theaters'}
+            busy={busy}
+            downloads={type === 'movie' ? downloads : downloads.filter((d) => d.season === picking.season && d.episode === picking.episode)}
+            onDownloaded={() => {
+              refreshDownloads();
+              setPicking(null);
+              setTimeout(() => setFocus('title-play'), 50);
+            }}
+            onPlay={(src) => play(picking, src)}
+          />
+        )}
+      </div>
+
+      {similar.length > 0 && (
+        <div className="rows rows-detail">
+          <Row title="More like this" focusKey="row-similar">
+            {similar.map((c) => (
+              <TitleCard key={`${c.mediaType}-${c.id}`} item={c} />
+            ))}
+          </Row>
+        </div>
+      )}
+
+      {showMagnet && (
+        <MagnetModal
+          onClose={() => {
+            setShowMagnet(false);
+            setTimeout(() => setFocus('title-play'), 50);
+          }}
+          onPlay={(src) => {
+            setShowMagnet(false);
+            play(picking ?? target, src);
+          }}
+          onDownload={(src) => {
+            setShowMagnet(false);
+            download(picking ?? target, src);
+          }}
+        />
+      )}
+    </div>
+  );
+}

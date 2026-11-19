@@ -1,0 +1,69 @@
+# Starts FreeStream + Prowlarr (and optionally FlareSolverr).
+#
+#   docker compose up -d --build              # everything
+#   docker compose up -d prowlarr             # only Prowlarr (if you run FreeStream with `npm start`)
+#   docker compose --profile flaresolverr up -d   # also start FlareSolverr (for Cloudflare-protected indexers)
+#
+# All state lives in ./data (FreeStream settings/progress in ./data, Prowlarr in ./data/prowlarr).
+# Downloads are cached in ~/Movies/FreeStream on the Mac.
+
+name: freestream
+
+services:
+  freestream:
+    build: .
+    image: freestream:local
+    container_name: freestream
+    init: true
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # These override .env so paths and service addresses are right inside Docker.
+      PORT: 8080
+      HOST_PORT: ${PORT:-8080}
+      DATA_DIR: /data
+      DOWNLOAD_DIR: /downloads
+      TORRENT_PORT: 51413
+      INDEXER_TYPE: prowlarr
+      INDEXER_URL: http://prowlarr:9696
+      # Ollama runs on the Mac itself (it can use the M1 GPU; Docker can't).
+      OLLAMA_URL: http://host.docker.internal:11434
+      # Local time zone, so nightly suggestions run at 3am your time.
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${PORT:-8080}:8080"
+      - "51413:51413/tcp"
+      - "51413:51413/udp"
+    volumes:
+      - ./data:/data
+      - ${HOME}/Movies/FreeStream:/downloads
+    depends_on:
+      - prowlarr
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      - "9696:9696"
+    volumes:
+      - ./data/prowlarr:/config
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    profiles: ["flaresolverr"]
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      - "8191:8191"

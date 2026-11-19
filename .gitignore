@@ -1,0 +1,25 @@
+# Dependencies and builds
+node_modules
+dist
+*.tsbuildinfo
+.vite
+
+# Local state and secrets: settings (incl. API keys), profiles, history, Prowlarr config
+data/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# webOS build output (config.js contains this network's IP)
+*.ipk
+webos/dist
+webos/app/config.js
+
+# Editors / OS / tools
+.DS_Store
+.idea
+.vscode
+.claude
+*.log
