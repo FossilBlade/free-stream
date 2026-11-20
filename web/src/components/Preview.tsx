@@ -1,7 +1,8 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
 import { AlertTriangle, CheckCircle2, Download, Play, Volume2, VolumeX, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { api, ApiError, formatBytes, formatTime, streamUrl, type MediaType, type PlayInfo, type SavedSource, type TorrentStatus, type Verdict } from '../api';
+import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, type MediaInfo, type MediaType, type PlayInfo, type SavedSource, type TorrentStatus, type Verdict } from '../api';
+import { canDecodeVideo, choosePlayMode, type PlayMode } from '../playback';
 import { useBackHandler } from '../back';
 import { FocusGroup, Focusable } from './Focusable';
 import { Button, Spinner } from './ui';
@@ -50,7 +51,8 @@ export function PreviewModal({
   const [res, setRes] = useState<{ w: number; h: number } | null>(null);
   const [noAudio, setNoAudio] = useState(false);
   const [buffering, setBuffering] = useState(true);
-  const [muted, setMuted] = useState(true);
+  // Sound on by default; if the browser blocks autoplay with sound, fall back to muted (the button shows it).
+  const [muted, setMuted] = useState(false);
   const [jump, setJump] = useState(0);
   const [status, setStatus] = useState<TorrentStatus | null>(null);
   const [duration, setDuration] = useState(0);
@@ -58,6 +60,46 @@ export function PreviewModal({
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [checking, setChecking] = useState(false);
   const [checkError, setCheckError] = useState<string | null>(null);
+  // Direct play, or the server's ffmpeg conversion when this device can't decode the file.
+  const [mode, setMode] = useState<PlayMode | null>(null);
+  const [convertStart, setConvertStart] = useState(0);
+  const media = useRef<MediaInfo | null>(null);
+  const canConvert = useRef(false);
+
+  /** Converted previews restart at each spot; copied video starts on the keyframe at or before it. */
+  const convertAt = async (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
+    if (!info) return;
+    const start = m.video === 'copy' && t > 0 ? await api.convertStart(info.infoHash, info.fileIdx, t, true).catch(() => t) : t;
+    setBuffering(true);
+    setConvertStart(start);
+    setMode(m);
+  };
+
+  // Check the file's real codecs before playing it.
+  useEffect(() => {
+    if (!info) return;
+    let live = true;
+    setMode(null);
+    const fallback = window.setTimeout(() => live && setMode((m) => m || { kind: 'direct' }), 25000);
+    api
+      .media(info.infoHash, info.fileIdx, true)
+      .then((r) => {
+        if (!live) return;
+        media.current = r.info;
+        canConvert.current = r.canConvert;
+        const m = choosePlayMode(r.info, r.canConvert);
+        if (m.kind === 'convert') {
+          if (r.info?.durationSec) setDuration(r.info.durationSec);
+          convertAt((r.info?.durationSec || 0) * JUMPS[0], m);
+        } else setMode((cur) => cur || m);
+      })
+      .catch(() => live && setMode((m) => m || { kind: 'direct' }));
+    return () => {
+      live = false;
+      window.clearTimeout(fallback);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info]);
 
   useEffect(() => {
     let live = true;
@@ -130,26 +172,58 @@ export function PreviewModal({
     return true;
   });
 
+  /** Plays with sound when allowed; if the browser refuses autoplay with sound, plays muted instead. */
+  const playSafely = (v: HTMLVideoElement) => {
+    v.play().catch((e: DOMException) => {
+      if (e?.name !== 'NotAllowedError' || v.muted) return;
+      v.muted = true;
+      setMuted(true);
+      v.play().catch(() => {});
+    });
+  };
+
   const seekTo = (i: number) => {
     const v = video.current;
     setJump(i);
+    if (mode?.kind === 'convert') {
+      convertAt((media.current?.durationSec || duration) * JUMPS[i], mode);
+      return;
+    }
     if (v && v.duration) {
       v.currentTime = v.duration * JUMPS[i];
-      v.play().catch(() => {});
+      playSafely(v);
     }
   };
 
   const onMeta = () => {
     const v = video.current!;
+    if (mode?.kind === 'convert') {
+      // Converted streams already start at the chosen spot; re-encoded video may be scaled, so report the file's size.
+      const m = media.current;
+      setRes(mode.video === 'h264' && m?.width ? { w: m.width, h: m.height } : { w: v.videoWidth, h: v.videoHeight });
+      if (m?.durationSec) setDuration(m.durationSec);
+      playSafely(v);
+      return;
+    }
     setRes({ w: v.videoWidth, h: v.videoHeight });
     setDuration(v.duration);
     if (!v.videoWidth) setPlayError('This file has no video this device can decode.');
     v.currentTime = v.duration * JUMPS[0];
-    v.play().catch(() => {});
+    playSafely(v);
   };
 
   const onVideoError = () => {
     const code = video.current?.error?.code;
+    // Can't decode it here: try the server's conversion before giving up.
+    if (canConvert.current && mode?.kind !== 'convert') {
+      const m = media.current;
+      convertAt((m?.durationSec || duration) * JUMPS[jump], { kind: 'convert', video: m && !canDecodeVideo(m.videoCodec) ? 'h264' : 'copy', reason: 'Converting this file for this device' });
+      return;
+    }
+    if (canConvert.current && mode?.kind === 'convert' && mode.video === 'copy') {
+      convertAt((media.current?.durationSec || duration) * JUMPS[jump], { kind: 'convert', video: 'h264', reason: 'Converting video and audio for this device' });
+      return;
+    }
     setPlayError(
       code === 4
         ? 'This device can’t play this file’s format (usually HEVC/x265, AV1, or DTS audio in an MKV). Try a source marked “Plays well”.'
@@ -186,15 +260,16 @@ export function PreviewModal({
               <AlertTriangle className="warn-icon" />
               <p>{error}</p>
             </div>
-          ) : !info ? (
+          ) : !info || !mode ? (
             <div className="preview-overlay">
-              <Spinner label={status ? `Connecting… ${status.peers} peers` : 'Fetching torrent info from peers…'} />
+              <Spinner label={info ? 'Checking the file format…' : status ? `Connecting… ${status.peers} peers` : 'Fetching torrent info from peers…'} />
             </div>
           ) : (
             <>
               <video
                 ref={video}
-                src={streamUrl(info, true)}
+                key={mode.kind === 'convert' ? `convert-${mode.video}-${convertStart}` : 'direct'}
+                src={mode.kind === 'convert' ? convertUrl(info, convertStart, mode.video, true) : streamUrl(info, true)}
                 muted={muted}
                 playsInline
                 preload="metadata"
@@ -234,7 +309,7 @@ export function PreviewModal({
           {info && info.subtitles.length > 0 && <span className="fact">{info.subtitles.length} subtitle file(s)</span>}
           {quality && !playError && !noAudio && (
             <span className="fact fact-good">
-              <CheckCircle2 /> Plays on this device
+              <CheckCircle2 /> {mode?.kind === 'convert' ? (mode.video === 'copy' ? 'Plays here with converted audio' : 'Plays here, converted (uses more CPU)') : 'Plays on this device'}
             </span>
           )}
           {noAudio && (

@@ -37,6 +37,8 @@ export interface SearchRequest {
   screen?: number;
   /** False when the device can't decode Dolby (AC3/E-AC3) audio, e.g. Chrome on a computer. */
   dolby?: boolean;
+  /** ffmpeg is available: audio the device can't decode gets converted on the fly. */
+  canConvert?: boolean;
 }
 
 export class IndexerError extends Error {
@@ -229,9 +231,17 @@ export function resolutionFit(res: string | null, screen?: number): number {
   return h >= screen / 2 ? 3 : 1; // 1080p on a 4K screen, 720p on a 1080p one
 }
 
-/** Playability on this device: Dolby audio fails where it can't be decoded. */
-export function devicePlayability(r: Pick<Release, 'playability' | 'info'>, dolby?: boolean): Playability {
-  if (dolby === false && (r.info.audio === 'AC3' || r.info.audio === 'EAC3')) return 'risky';
+/** True when only the audio stops this release playing directly on the device (fixable by converting the audio). */
+export function audioNeedsConversion(r: Pick<Release, 'info'>, dolby?: boolean): boolean {
+  const videoOk = r.info.codec !== 'AV1' && r.info.codec !== 'XviD' && r.info.source !== 'Remux';
+  const dts = r.info.audio === 'DTS' || r.info.audio === 'TrueHD';
+  const dolbyHere = dolby === false && (r.info.audio === 'AC3' || r.info.audio === 'EAC3');
+  return videoOk && (dts || dolbyHere);
+}
+
+/** Playability on this device: audio it can't decode fails, unless the server can convert it. */
+export function devicePlayability(r: Pick<Release, 'playability' | 'info'>, dolby?: boolean, canConvert?: boolean): Playability {
+  if (audioNeedsConversion(r, dolby)) return canConvert ? 'ok' : 'risky';
   return r.playability;
 }
 
@@ -253,7 +263,7 @@ export function score(r: Release, req: SearchRequest): number {
   const langBonus = req.preferLanguages?.length && r.info.languages.some((l) => req.preferLanguages!.includes(l)) ? 8 : 0;
   const theaterPenalty = r.tier === 'theater' ? 100 : 0; // full releases always rank above theater copies
   const sizePenalty = r.sizeFlag === 'small' ? 12 : r.sizeFlag === 'large' ? 6 : 0;
-  return seeds + PLAY_SCORE[devicePlayability(r, req.dolby)] * 6 + resolutionFit(r.info.resolution, req.screen) * 3 + exactEpisode + langBonus - sizePenalty - theaterPenalty;
+  return seeds + PLAY_SCORE[devicePlayability(r, req.dolby, req.canConvert)] * 6 + resolutionFit(r.info.resolution, req.screen) * 3 + exactEpisode + langBonus - sizePenalty - theaterPenalty;
 }
 
 export interface SearchResult {

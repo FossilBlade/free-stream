@@ -3,7 +3,7 @@
  * Builds on indexers.score() (seeders, playability here, resolution for this screen, size, language)
  * and adds what earlier deep checks found.
  */
-import { devicePlayability, resolutionFit, score, type Release, type SearchRequest } from './indexers.ts';
+import { audioNeedsConversion, devicePlayability, resolutionFit, score, type Release, type SearchRequest } from './indexers.ts';
 import type { Verdict } from './store.ts';
 
 export interface RankedRelease extends Release {
@@ -28,8 +28,9 @@ function reasonFor(r: RankedRelease, req: SearchRequest): string {
     else if (req.screen && fit === 2) parts.push(`${resName(res)} (more than your screen shows)`);
     else parts.push(resName(res));
   }
-  const play = devicePlayability(r, req.dolby);
-  if (play === 'good') parts.push('Plays on this device');
+  const play = devicePlayability(r, req.dolby, req.canConvert);
+  if (req.canConvert && audioNeedsConversion(r, req.dolby)) parts.push('Audio converted for this device');
+  else if (play === 'good') parts.push('Plays on this device');
   else if (play === 'ok') parts.push('Should play here');
   const lang = req.preferLanguages?.find((l) => r.info.languages.includes(l));
   if (lang) parts.push(`${lang} audio`);
@@ -45,7 +46,7 @@ export function rankForDevice(releases: RankedRelease[], req: SearchRequest): Ra
   const total = (r: RankedRelease) => score(r, req) + (r.verdict ? VERDICT_BONUS[r.verdict.outcome] : 0);
   const sorted = releases.map((r) => ({ r, s: total(r) })).sort((a, b) => b.s - a.s).map((x) => x.r);
   const best = sorted.find(
-    (r) => r.tier === 'full' && r.sizeFlag !== 'small' && devicePlayability(r, req.dolby) !== 'risky' && r.seeders >= 3 && r.verdict?.outcome !== 'suspect',
+    (r) => r.tier === 'full' && r.sizeFlag !== 'small' && devicePlayability(r, req.dolby, req.canConvert) !== 'risky' && r.seeders >= 3 && r.verdict?.outcome !== 'suspect',
   );
   if (best) {
     best.best = true;

@@ -177,6 +177,18 @@ export interface PlayInfo {
   resumeAt: number;
 }
 
+/** Real codecs of a file (ffprobe), to decide between direct play and conversion. */
+export interface MediaInfo {
+  durationSec: number;
+  videoCodec: string;
+  width: number;
+  height: number;
+  audio: { codec: string; language: string; channels: number }[];
+  container: string;
+  /** Interlaced (TV broadcast) video: must be re-encoded when converting for a browser. */
+  interlaced: boolean;
+}
+
 /** Live status of a running torrent (player buffering, preview). */
 export interface TorrentStatus {
   infoHash: string;
@@ -362,13 +374,17 @@ export const api = {
     }>(`/title/${type}/${id}`),
   season: (id: number, n: number) => get<{ episodes: Episode[]; savedSource: SavedSource | null; downloads: DownloadRow[] }>(`/title/tv/${id}/season/${n}`),
   sources: (p: { type: MediaType; id?: number; title: string; year?: string; season?: number; episode?: number; screen?: number; dolby?: 0 | 1 }) =>
-    get<{ releases: Release[]; skipped: string[] }>(`/sources?${qs(p)}`),
+    get<{ releases: Release[]; skipped: string[]; canConvert?: boolean }>(`/sources?${qs(p)}`),
   prewarm: (b: { mediaType: MediaType; tmdbId: number; season?: number }) => request<{ ok: boolean }>('POST', '/prewarm', b),
   forgetSource: (type: MediaType, id: number, season?: number) => request('DELETE', `/sources/${type}/${id}?${qs({ season })}`),
   play: (b: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource }) =>
     request<PlayInfo>('POST', '/play', b),
   preview: (b: { source: SavedSource; season?: number; episode?: number; mediaType?: MediaType; tmdbId?: number }) => request<PlayInfo & { fileSize: number }>('POST', '/preview', b),
   discardPreview: (hash: string) => request<{ discarded: boolean }>('DELETE', `/preview/${hash}`),
+  media: (hash: string, file: number, preview = false) => get<{ canConvert: boolean; info: MediaInfo | null; error?: string }>(`/media/${hash}/${file}${preview ? '?preview' : ''}`),
+  /** Where a copied-video conversion near `at` really starts: the keyframe at or before it (keeps sound in sync). */
+  convertStart: (hash: string, file: number, at: number, preview = false) =>
+    get<{ start: number }>(`/convert/${hash}/${file}/start?at=${at.toFixed(2)}${preview ? '&preview' : ''}`).then((r) => r.start),
   torrentStatus: (hash: string, file?: number) => get<TorrentStatus>(`/torrents/${hash}/status?${qs({ file })}`),
   saveProgress: (p: Omit<Progress, 'updatedAt'>) => request('POST', '/progress', p),
   clearProgress: (type: MediaType, id: number) => request('DELETE', `/progress/${type}/${id}`),
@@ -392,6 +408,9 @@ export const api = {
 };
 
 export const streamUrl = (p: PlayInfo, preview = false) => `/api/stream/${p.infoHash}/${p.fileIdx}${preview ? '?preview' : ''}`;
+/** ffmpeg-converted stream starting at `start` seconds (fragmented MP4; seeking restarts it). */
+export const convertUrl = (p: PlayInfo, start: number, video: 'copy' | 'h264', preview = false) =>
+  `/api/convert/${p.infoHash}/${p.fileIdx}?start=${start.toFixed(3)}&video=${video}${preview ? '&preview' : ''}`;
 
 export const releaseSource = (r: Release): SavedSource => ({ magnet: r.magnet, downloadUrl: r.downloadUrl, infoHash: r.infoHash, releaseTitle: r.title });
 export const saveFileUrl = (hash: string, fileIdx: number) => `/api/downloads/${hash}/file?file=${fileIdx}`;
@@ -406,7 +425,7 @@ export function downloadMessage(r: { status: string; fileName: string }): string
 /** "S1:E3" for episodes, "" for movies. */
 export const episodeLabel = (season: number | null | undefined, episode: number | null | undefined) =>
   season != null && episode != null ? `S${season}:E${episode}` : '';
-export const subtitleUrl = (hash: string, idx: number) => `/api/subs/${hash}/${idx}.vtt`;
+export const subtitleUrl = (hash: string, idx: number, offset = 0) => `/api/subs/${hash}/${idx}.vtt${offset > 0 ? `?offset=${offset.toFixed(1)}` : ''}`;
 
 type ImgSize = 'w185' | 'w300' | 'w342' | 'w500' | 'w780' | 'w1280' | 'original';
 export const img = (path: string | null | undefined, size: ImgSize) => (path ? `https://image.tmdb.org/t/p/${size}${path}` : '');

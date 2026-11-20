@@ -1,5 +1,18 @@
 import { AlertTriangle, CheckCircle2, Clapperboard, HelpCircle, XCircle } from 'lucide-react';
 import { OUTCOME_TONE, type Verdict } from '../api';
+import { canDecodeAudio, canDecodeVideo } from '../playback';
+
+/** What the measured codecs mean on this device (the check judges the file, not whether it plays here). */
+function playbackNote(v: Verdict): string | null {
+  const p = v.probe;
+  if (!p) return null;
+  const audio = p.audio[0]?.codec;
+  const videoOk = !p.videoCodec || canDecodeVideo(p.videoCodec);
+  const audioOk = !audio || canDecodeAudio(audio);
+  if (videoOk && audioOk) return null;
+  const what = [!videoOk && `${p.videoCodec.toUpperCase()} video`, !audioOk && `${audio.toUpperCase()} audio`].filter(Boolean).join(' and ');
+  return `This device can’t play its ${what} directly, so FreeStream converts it while you watch${videoOk ? '' : ' (slower to start, uses more of the server’s CPU)'}.`;
+}
 
 const ICON = { verified: CheckCircle2, theater: Clapperboard, suspect: HelpCircle, rejected: XCircle } as const;
 const HEADLINE = { verified: 'Verified', theater: 'Theater copy', suspect: 'Not confirmed', rejected: 'Rejected' } as const;
@@ -15,6 +28,7 @@ export function VerdictCard({ v, compact }: { v: Verdict; compact?: boolean }) {
         <span>{v.label}</span>
       </div>
       {v.ai?.summary && <p className="verdict-summary">{v.ai.summary}</p>}
+      {playbackNote(v) && <p className="verdict-summary muted small">{playbackNote(v)}</p>}
       {!compact && (v.ai?.issues.length || v.fileIssues.length || v.runtimeCheck === 'short') ? (
         <ul className="verdict-issues">
           {v.runtimeCheck === 'short' && <li>Shorter than the film's listed runtime — may be incomplete.</li>}

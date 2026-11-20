@@ -24,6 +24,7 @@ Written in TypeScript: React + Vite on the front end, Express + WebTorrent on th
 - **Catalog from TMDB:** trending, popular, new releases, genres, seasons and episodes, cast, trailers and age ratings.
 - **Netflix-style interface** with its own teal-and-amber theme, built for the TV remote: arrow keys, OK and Back everywhere, LG Magic Remote pointer support, and media keys in the player. It runs on old TV browsers (LG webOS 5, Chromium 68). On phones the main sections move to a bottom tab bar.
 - **Streams while downloading** (WebTorrent). Seeking jumps ahead in the download. In season packs, each episode picks its own file.
+- **Live conversion with ffmpeg** when a device can't play a file directly, most often Dolby or DTS audio in Chrome (see [If something won't play](#if-something-wont-play)).
 - **Continue Watching, My List, resume position**, auto "next episode", and subtitles bundled with the torrent.
 - **Downloads page:** download for offline viewing, **Keep** a download so it's never cleaned up, save the file to the device you're on, or delete it. Downloads are linked to their titles, so a title page shows "On this computer" instead of offering to download it again.
 - **Download-only by default:** FreeStream doesn't upload to other peers unless you turn sharing on in Settings.
@@ -182,13 +183,19 @@ Everything can be set on the **Settings** page; values saved there take preceden
 
 ## If something won't play
 
-Streaming sends the raw file to the browser; nothing is converted. The badges on each source predict this:
+FreeStream sends the raw file when the device can play it. When it can't, it converts the file live with ffmpeg (included in the Docker image; install it yourself with `npm start`):
 
-- **Plays well:** H.264 video with AAC audio plays almost everywhere. With AC3 audio it plays on TVs and in Safari.
-- **Likely plays:** HEVC/x265 or HDR is fine on LG TVs and Safari, and usually in Chrome on a Mac.
-- **May not play:** DTS/TrueHD audio, AV1 and Remux files often fail or play without sound. Dolby (AC3/E-AC3) audio doesn't play in Chrome or Firefox on a computer.
+- **Before playing**, the player reads the file's real codecs and compares them with what this device can decode.
+- **Audio it can't play** (Dolby AC3/E-AC3 in Chrome or Firefox on a computer or phone, DTS or TrueHD anywhere) is converted to AAC, and the video is passed through untouched. This is cheap and starts in a second or two. The player shows "Converting … audio for this device".
+- **Video it can't decode** (for example HEVC or AV1 without a decoder, or XviD) is re-encoded to H.264. This uses a lot of the server's CPU, and on a Mac Docker can't use hardware encoding, so prefer a source marked "Plays well" when there is one.
+- **Seeking** in a converted stream restarts the conversion at the new position. Subtitles shift to match.
+- **If playback fails anyway**, the player retries with conversion before showing an error.
 
-Use **Preview** to check before watching. In the player, **Choose another source** forgets the bad one and reopens the list.
+On the source list, the badges predict this:
+- **Audio converted here:** fine; the audio is converted while you watch.
+- **May not play here:** AV1, XviD or Remux files, or anything that needs conversion when ffmpeg isn't installed.
+
+Use **Preview** to check a source before watching. In the player, **Choose another source** forgets the bad one and reopens the list.
 
 ## Development
 

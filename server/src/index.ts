@@ -45,7 +45,8 @@ import {
   type SavedSource,
   type Settings,
 } from './store.ts';
-import { srtToVtt } from './subtitles.ts';
+import { shiftVtt, srtToVtt } from './subtitles.ts';
+import { keyframeAt, mediaInfo, setTranscodeBaseUrl, transcode } from './transcode.ts';
 import * as tmdb from './tmdb.ts';
 import {
   addSource,
@@ -376,6 +377,7 @@ app.get('/api/sources', adultsOnly, async (req, res) => {
     // What this device can show and decode, so the best pick suits it.
     screen: screen && [720, 1080, 2160].includes(screen) ? screen : undefined,
     dolby: req.query.dolby === '0' ? false : req.query.dolby === '1' ? true : undefined,
+    canConvert: hasFfmpeg,
   };
   const { releases, skipped } = await searchReleases(request);
   // Attach what earlier deep checks found, so the list can show it.
@@ -385,7 +387,7 @@ app.get('/api/sources', adultsOnly, async (req, res) => {
       return { ...r, verdict: v ? { outcome: v.outcome, label: v.label, summary: v.ai?.summary || null, checkedBy: v.ai ? `${v.ai.provider} · ${v.ai.model}` : null } : null };
     })
     .filter((r) => r.verdict?.outcome !== 'rejected');
-  res.json({ releases: rankForDevice(withVerdicts, request), skipped });
+  res.json({ releases: rankForDevice(withVerdicts, request), skipped, canConvert: hasFfmpeg });
 });
 
 /** Search hints from TMDB: every plausible release year, other titles, preferred audio languages. */
@@ -622,7 +624,52 @@ app.get('/api/subs/:hash/:idx', async (req, res) => {
   const idx = int(String(req.params.idx).replace(/\.vtt$/, ''), 'file');
   const text = await readFileText(t, idx);
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-  res.send(t.files[idx].name.toLowerCase().endsWith('.vtt') ? text : srtToVtt(text));
+  const vtt = t.files[idx].name.toLowerCase().endsWith('.vtt') ? text : srtToVtt(text);
+  // Converted streams start mid-file; their subtitles are shifted to match.
+  const offset = Number(req.query.offset) || 0;
+  res.send(offset > 0 ? shiftVtt(vtt, offset) : vtt);
+});
+
+/** Real codecs of a file, so the player can decide between direct play and conversion. */
+app.get('/api/media/:hash/:idx', async (req, res) => {
+  const t = await getTorrent(hash(req.params.hash));
+  const idx = int(req.params.idx, 'file');
+  if (!t.files[idx]) throw new HttpError(404, 'No such file');
+  if (!hasFfmpeg) return void res.json({ canConvert: false, info: null });
+  try {
+    res.json({ canConvert: true, info: await mediaInfo(t.infoHash, idx, t.files[idx].name, req.query.preview !== undefined) });
+  } catch (e) {
+    res.json({ canConvert: true, info: null, error: (e as Error).message });
+  }
+});
+
+/** Where a copied-video conversion starting near `at` really starts (the keyframe at or before it). */
+app.get('/api/convert/:hash/:idx/start', async (req, res) => {
+  const t = await getTorrent(hash(req.params.hash));
+  const idx = int(req.params.idx, 'file');
+  if (!t.files[idx]) throw new HttpError(404, 'No such file');
+  const at = Math.max(0, Number(req.query.at) || 0);
+  res.json({ start: hasFfmpeg ? await keyframeAt(t.infoHash, idx, at, req.query.preview !== undefined) : at });
+});
+
+/** Live ffmpeg conversion to fragmented MP4: AAC audio, video copied or re-encoded to H.264. */
+app.get('/api/convert/:hash/:idx', async (req, res) => {
+  if (!hasFfmpeg) throw new HttpError(501, 'ffmpeg isn’t installed on the server, so files can’t be converted.');
+  const t = await getTorrent(hash(req.params.hash));
+  const idx = int(req.params.idx, 'file');
+  if (!t.files[idx]) throw new HttpError(404, 'No such file');
+  const preview = req.query.preview !== undefined;
+  const info = await mediaInfo(t.infoHash, idx, t.files[idx].name, preview).catch(() => null);
+  await transcode(req, res, {
+    infoHash: t.infoHash,
+    fileIdx: idx,
+    start: Math.max(0, Number(req.query.start) || 0),
+    video: req.query.video === 'h264' ? 'h264' : 'copy',
+    audioTrack: Math.max(0, optInt(req.query.audio, 'audio') || 0),
+    videoCodec: info?.videoCodec || '',
+    interlaced: !!info?.interlaced,
+    preview,
+  });
 });
 
 app.get('/api/torrents/:hash/status', async (req, res) => {
@@ -758,6 +805,7 @@ async function resolveDownloadTitle(d: CachedDownload): Promise<{ mediaType: Med
 }
 
 setSelfBaseUrl(`http://127.0.0.1:${PORT}`);
+setTranscodeBaseUrl(`http://127.0.0.1:${PORT}`);
 startWatcher();
 startSuggestions();
 

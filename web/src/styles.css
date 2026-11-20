@@ -2163,3 +2163,32 @@ html.tv .player video::cue {
 .suggest-status li {
   margin-bottom: 0.25rem;
 }
+.player-convert {
+  color: var(--amber);
+  font-size: 0.8rem;
+}
+
+/* Continue Watching: the card plays; "Details" under it opens the title page. */
+.continue-item {
+  width: var(--card-w);
+}
+.continue-info {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 0.45rem;
+  padding: 0.25rem 0.6rem 0.25rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  color: var(--text-2);
+  background: rgba(233, 244, 242, 0.06);
+  cursor: pointer;
+}
+.continue-info svg {
+  width: 1rem;
+  height: 1rem;
+  margin-right: 0.35rem;
+}
+.continue-info.is-focused {
+  background: var(--amber);
+  color: #1a1204;
+}

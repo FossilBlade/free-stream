@@ -10,10 +10,17 @@ import { PreviewModal } from './Preview';
 import { toast } from './Toast';
 import { Badge, Button, Message, Spinner } from './ui';
 
-/** Only flag a source when it probably won't work on this device; everything else stays quiet. */
-function mayNotPlayHere(r: Release): boolean {
-  const dolby = r.info.audio === 'AC3' || r.info.audio === 'EAC3';
-  return r.playability === 'risky' || (dolby && !canPlayDolbyAudio);
+/** Audio this device can't decode (DTS/TrueHD anywhere, Dolby outside TVs and Safari) while the video itself is fine. */
+function audioOnlyProblem(r: Release): boolean {
+  const videoOk = r.info.codec !== 'AV1' && r.info.codec !== 'XviD' && r.info.source !== 'Remux';
+  const dolby = (r.info.audio === 'AC3' || r.info.audio === 'EAC3') && !canPlayDolbyAudio;
+  return videoOk && (dolby || r.info.audio === 'DTS' || r.info.audio === 'TrueHD');
+}
+
+/** How a source will play here: quietly fine, with converted audio, or probably not at all. */
+function playNote(r: Release, canConvert: boolean): 'convert' | 'risky' | null {
+  if (audioOnlyProblem(r)) return canConvert ? 'convert' : 'risky';
+  return r.playability === 'risky' ? 'risky' : null;
 }
 
 export type PickMode = 'play' | 'download';
@@ -43,6 +50,7 @@ type Filter = 'all' | '2160p' | '1080p' | '720p';
 export function Sources({ mediaType, tmdbId, title, year, season, episode, mode, subtitle, theaterFocus, busy, downloads = [], onDownloaded, onPlay }: SourcesProps) {
   const navigate = useNavigate();
   const [releases, setReleases] = useState<Release[] | null>(null);
+  const [canConvert, setCanConvert] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
   const [filter, setFilter] = useState<Filter>('all');
   const [preview, setPreview] = useState<Release | null>(null);
@@ -55,7 +63,11 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
     setError(null);
     api
       .sources({ type: mediaType, id: tmdbId, title, year, season, episode, screen: screenHeight(), dolby: canPlayDolbyAudio ? 1 : 0 })
-      .then((r) => live && setReleases(r.releases))
+      .then((r) => {
+        if (!live) return;
+        setReleases(r.releases);
+        setCanConvert(!!r.canConvert);
+      })
       .catch((e: ApiError) => live && setError(e));
     return () => {
       live = false;
@@ -116,7 +128,8 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
             {r.tier === 'theater' && <Badge tone="ok">{r.info.theater === 'screener' ? 'Screener' : 'Theater recording'}</Badge>}
             {r.info.multiAudio ? <Badge>Dual audio</Badge> : r.info.languages.slice(0, 2).map((l) => <Badge key={l}>{l}</Badge>)}
             {r.info.pack && <Badge>Full season</Badge>}
-            {mayNotPlayHere(r) && <Badge tone="risky">May not play here</Badge>}
+            {playNote(r, canConvert) === 'risky' && <Badge tone="risky">May not play here</Badge>}
+            {playNote(r, canConvert) === 'convert' && <Badge>Audio converted here</Badge>}
             {r.sizeFlag === 'small' && <Badge tone="risky">Small for {r.info.resolution === '2160p' ? '4K' : r.info.resolution} — low quality?</Badge>}
             {r.sizeFlag === 'large' && <Badge>Very large — slower to stream</Badge>}
             <span className="release-stats">

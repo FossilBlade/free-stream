@@ -2,9 +2,10 @@ import { pause as pauseNav, resume as resumeNav } from '@noriginmedia/norigin-sp
 import { AlertTriangle, ArrowLeft, Captions, Maximize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, formatBytes, formatTime, streamUrl, subtitleUrl, type Details, type Episode, type MediaType, type PlayInfo, type TorrentStatus } from '../api';
+import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, subtitleUrl, type Details, type Episode, type MediaInfo, type MediaType, type PlayInfo, type TorrentStatus } from '../api';
 import { runBackHandlers } from '../back';
 import { Spinner } from '../components/ui';
+import { canDecodeVideo, choosePlayMode, type PlayMode } from '../playback';
 import { isBackKey, isTV, KEY } from '../tv';
 
 const SEEK_STEP = 10;
@@ -45,6 +46,40 @@ export function Player() {
   const [btn, setBtn] = useState<ButtonId>('play');
   const [subCursor, setSubCursor] = useState(0);
   const [countdown, setCountdown] = useState<number | null>(null);
+  // Direct play, or ffmpeg conversion on the server (decided from the file's real codecs).
+  const [mode, setMode] = useState<PlayMode | null>(null);
+  /** Converted streams start at `offset` seconds into the file; the video element's clock starts at 0. */
+  const [offset, setOffset] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
+  const modeRef = useRef<PlayMode | null>(null);
+  const offsetRef = useRef(0);
+  const mediaDurRef = useRef(0);
+  const mediaRef = useRef<MediaInfo | null>(null);
+  const canConvertRef = useRef(false);
+  const timeRef = useRef(0);
+  const pendingSeek = useRef<number | null>(null);
+  const seekTimer = useRef<number | undefined>(undefined);
+  modeRef.current = mode;
+  offsetRef.current = offset;
+  mediaDurRef.current = mediaDuration;
+  const converting = mode?.kind === 'convert';
+  const infoRef = useRef<PlayInfo | null>(null);
+  infoRef.current = info;
+
+  /**
+   * Start (or restart) conversion near `t` seconds. Copied video can only start on a keyframe, so ask
+   * the server where that is and start there: audio and video then begin at the same moment.
+   */
+  const convertFrom = useCallback(async (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
+    const i = infoRef.current;
+    if (!i) return;
+    const start = m.video === 'copy' && t > 0 ? await api.convertStart(i.infoHash, i.fileIdx, t).catch(() => t) : t;
+    if (infoRef.current !== i) return;
+    timeRef.current = start;
+    setTime(start);
+    setOffset(start);
+    setMode(m);
+  }, []);
   const hideTimer = useRef<number | undefined>(undefined);
   const stallTimer = useRef<number | undefined>(undefined);
   const lastTime = useRef(-1);
@@ -69,6 +104,11 @@ export function Player() {
     setDuration(0);
     setCountdown(null);
     setWaiting(true);
+    setMode(null);
+    setOffset(0);
+    setMediaDuration(0);
+    mediaRef.current = null;
+    pendingSeek.current = null;
     if (fromState) {
       setInfo(fromState);
       return;
@@ -105,6 +145,49 @@ export function Player() {
       .catch(() => {});
   }, [type, id, season]);
 
+  // Check the file's real codecs: play directly if this device can, otherwise convert on the server.
+  useEffect(() => {
+    if (!info) return;
+    let live = true;
+    // Don't keep people waiting on a slow probe: after 25s just try playing directly.
+    const fallback = window.setTimeout(() => live && !modeRef.current && setMode({ kind: 'direct' }), 25000);
+    api
+      .media(info.infoHash, info.fileIdx)
+      .then((r) => {
+        if (!live) return;
+        canConvertRef.current = r.canConvert;
+        mediaRef.current = r.info;
+        if (r.info?.durationSec) setMediaDuration(r.info.durationSec);
+        const m = choosePlayMode(r.info, r.canConvert);
+        const cur = modeRef.current;
+        if (!cur) {
+          if (m.kind !== 'convert') return setMode(m);
+          const resume = info.resumeAt && (!r.info?.durationSec || info.resumeAt < r.info.durationSec - 10) ? info.resumeAt : 0;
+          convertFrom(resume, m);
+        } else if (cur.kind === 'direct' && m.kind === 'convert') {
+          // Started directly after the timeout, but it can't play here: switch, keeping the place.
+          convertFrom(timeRef.current, m);
+        }
+      })
+      .catch(() => live && !modeRef.current && setMode({ kind: 'direct' }));
+    return () => {
+      live = false;
+      window.clearTimeout(fallback);
+    };
+  }, [info, convertFrom]);
+  useEffect(() => () => window.clearTimeout(seekTimer.current), []);
+
+  /** Position in the file (converted streams add their start offset). */
+  const absTime = useCallback(() => (video.current?.currentTime || 0) + (modeRef.current?.kind === 'convert' ? offsetRef.current : 0), []);
+  const totalDuration = useCallback(() => {
+    const d = video.current?.duration;
+    if (modeRef.current?.kind === 'convert') return mediaDurRef.current;
+    return d && isFinite(d) ? d : mediaDurRef.current;
+  }, []);
+  useEffect(() => {
+    if (converting && mediaDuration) setDuration(mediaDuration);
+  }, [converting, mediaDuration]);
+
   // Default to the first English subtitle only when the file came with subtitles and the user hasn't chosen.
   useEffect(() => {
     setSubIdx(null);
@@ -126,7 +209,9 @@ export function Player() {
     (beacon = false) => {
       const v = video.current;
       const s = saveState.current;
-      if (!v || !s.info || !v.duration || !isFinite(v.duration) || v.currentTime < 5) return;
+      const dur = totalDuration();
+      const pos = pendingSeek.current ?? absTime();
+      if (!v || !s.info || !dur || pos < 5) return;
       const body = {
         mediaType: type,
         tmdbId: id,
@@ -136,15 +221,15 @@ export function Player() {
         title: s.details?.title || '',
         posterPath: s.details?.posterPath ?? null,
         backdropPath: s.details?.backdropPath ?? null,
-        position: v.currentTime,
-        duration: v.duration,
+        position: pos,
+        duration: dur,
         infoHash: s.info.infoHash,
         fileIdx: s.info.fileIdx,
       };
       if (beacon && navigator.sendBeacon) navigator.sendBeacon('/api/progress', new Blob([JSON.stringify(body)], { type: 'application/json' }));
       else api.saveProgress(body).catch(() => {});
     },
-    [type, id],
+    [type, id, absTime, totalDuration],
   );
 
   useEffect(() => {
@@ -204,12 +289,43 @@ export function Player() {
     else v.pause();
   }, []);
 
-  const seekBy = useCallback((d: number) => {
-    const v = video.current;
-    if (!v || !v.duration) return;
-    v.currentTime = Math.max(0, Math.min(v.duration - 1, v.currentTime + d));
-    setTime(v.currentTime);
-  }, []);
+  /** Seek to a position in the file. Converted streams restart on the server unless it's already converted. */
+  const seekTo = useCallback(
+    (abs: number) => {
+      const v = video.current;
+      const dur = totalDuration();
+      if (!v || !dur) return;
+      const target = Math.max(0, Math.min(dur - 1, abs));
+      setTime(target);
+      timeRef.current = target;
+      if (modeRef.current?.kind !== 'convert') {
+        v.currentTime = target;
+        return;
+      }
+      const rel = target - offsetRef.current;
+      const b = v.buffered;
+      for (let i = 0; i < b.length; i++) {
+        if (rel >= b.start(i) && rel <= b.end(i) - 1) {
+          v.currentTime = rel;
+          return;
+        }
+      }
+      // Not converted yet: restart the conversion there (debounced so repeated presses restart once).
+      pendingSeek.current = target;
+      setStall(true);
+      window.clearTimeout(seekTimer.current);
+      seekTimer.current = window.setTimeout(() => {
+        const m = modeRef.current;
+        if (m?.kind !== 'convert') return;
+        convertFrom(target, m).finally(() => {
+          if (pendingSeek.current === target) pendingSeek.current = null;
+        });
+      }, 600);
+    },
+    [totalDuration, setStall, convertFrom],
+  );
+
+  const seekBy = useCallback((d: number) => seekTo((pendingSeek.current ?? absTime()) + d), [seekTo, absTime]);
 
   const exit = useCallback(() => {
     saveProgress();
@@ -350,8 +466,9 @@ export function Player() {
   // ---- video events ------------------------------------------------------------------------------------
   const onLoadedMetadata = () => {
     const v = video.current!;
-    setDuration(v.duration);
-    if (info?.resumeAt && info.resumeAt < v.duration - 10) v.currentTime = info.resumeAt;
+    setDuration(totalDuration());
+    // Converted streams already start at the resume point (or the seek target).
+    if (!converting && info?.resumeAt && info.resumeAt < v.duration - 10) v.currentTime = info.resumeAt;
     v.play().catch(() => setPlaying(false));
   };
 
@@ -359,11 +476,14 @@ export function Player() {
     const v = video.current!;
     if (!v.paused && v.currentTime !== lastTime.current && lastTime.current >= 0) setStall(false);
     lastTime.current = v.currentTime;
-    setTime(v.currentTime);
+    if (pendingSeek.current != null) return; // the bar shows the seek target until the restart
+    const base = converting ? offset : 0;
+    timeRef.current = base + v.currentTime;
+    setTime(base + v.currentTime);
     const b = v.buffered;
     for (let i = 0; i < b.length; i++) {
       if (b.start(i) <= v.currentTime + 0.5 && b.end(i) >= v.currentTime) {
-        setBufferedEnd(b.end(i));
+        setBufferedEnd(base + b.end(i));
         break;
       }
     }
@@ -371,6 +491,19 @@ export function Player() {
 
   const onVideoError = () => {
     const code = video.current?.error?.code;
+    // Can't decode it here: convert on the server before giving up (audio first, then video too).
+    if (canConvertRef.current) {
+      const m = modeRef.current;
+      const media = mediaRef.current;
+      if (m?.kind !== 'convert') {
+        convertFrom(timeRef.current, { kind: 'convert', video: media && !canDecodeVideo(media.videoCodec) ? 'h264' : 'copy', reason: 'Converting this file for this device' });
+        return;
+      }
+      if (m.video === 'copy') {
+        convertFrom(timeRef.current, { kind: 'convert', video: 'h264', reason: 'Converting video and audio for this device' });
+        return;
+      }
+    }
     setFatal({
       message:
         code === 4
@@ -410,11 +543,11 @@ export function Player() {
 
   return (
     <div className={`player${visible ? '' : ' is-idle'}`} onMouseMove={poke}>
-      {info && (
+      {info && mode && (
         <video
           ref={video}
-          key={`${info.infoHash}-${info.fileIdx}`}
-          src={streamUrl(info)}
+          key={`${info.infoHash}-${info.fileIdx}-${mode.kind}-${mode.kind === 'convert' ? `${mode.video}-${offset}` : ''}`}
+          src={mode.kind === 'convert' ? convertUrl(info, offset, mode.video) : streamUrl(info)}
           autoPlay
           playsInline
           muted={muted}
@@ -424,7 +557,7 @@ export function Player() {
           }}
           onDoubleClick={toggleFullscreen}
           onLoadedMetadata={onLoadedMetadata}
-          onDurationChange={() => setDuration(video.current!.duration)}
+          onDurationChange={() => setDuration(totalDuration())}
           onTimeUpdate={onTimeUpdate}
           onPlay={() => setPlaying(true)}
           onPause={() => {
@@ -447,7 +580,7 @@ export function Player() {
             <track
               key={subIdx}
               kind="subtitles"
-              src={subtitleUrl(info.infoHash, subIdx)}
+              src={subtitleUrl(info.infoHash, subIdx, converting ? offset : 0)}
               srcLang="en"
               label={subtitles.find((s) => s.idx === subIdx)?.label}
               default
@@ -460,13 +593,15 @@ export function Player() {
         </video>
       )}
 
-      {(!info || waiting) && !fatal && (
+      {(!info || !mode || waiting) && !fatal && (
         <div className="player-center">
           <Spinner
             label={
               !info
                 ? 'Finding peers and fetching the file list…'
-                : status
+                : !mode
+                  ? 'Checking the file format…'
+                  : status
                   ? `Buffering · ${status.peers} peer${status.peers === 1 ? '' : 's'} · ${formatBytes(status.downloadSpeed)}/s`
                   : 'Buffering…'
             }
@@ -501,6 +636,7 @@ export function Player() {
         <div>
           <div className="player-title">{title}</div>
           {subtitleLine && <div className="player-sub">{subtitleLine}</div>}
+          {mode?.kind === 'convert' && <div className="player-sub player-convert">{mode.reason}</div>}
         </div>
       </div>
 
@@ -521,8 +657,7 @@ export function Player() {
           className={`timeline${zone === 'timeline' ? ' is-focused' : ''}`}
           onClick={(e) => {
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-            const v = video.current;
-            if (v && duration) v.currentTime = ((e.clientX - r.left) / r.width) * duration;
+            if (duration) seekTo(((e.clientX - r.left) / r.width) * duration);
           }}
           onMouseEnter={() => setZone('timeline')}
         >

@@ -34,7 +34,7 @@ export const verdictForHash = (infoHash: string): Verdict | undefined => Object.
 
 // --- helpers -----------------------------------------------------------------------------
 
-function run(cmd: string, args: string[], timeoutMs: number): Promise<Buffer> {
+export function run(cmd: string, args: string[], timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const out: Buffer[] = [];
@@ -57,11 +57,11 @@ function run(cmd: string, args: string[], timeoutMs: number): Promise<Buffer> {
   });
 }
 
-async function probe(url: string): Promise<Verdict['probe']> {
+export async function probe(url: string): Promise<Verdict['probe']> {
   const out = await run('ffprobe', ['-v', 'error', '-rw_timeout', '60000000', '-print_format', 'json', '-show_format', '-show_streams', url], 120000);
   const j = JSON.parse(out.toString()) as {
     format?: { duration?: string };
-    streams?: { codec_type?: string; codec_name?: string; width?: number; height?: number; channels?: number; tags?: { language?: string; title?: string } }[];
+    streams?: { codec_type?: string; codec_name?: string; width?: number; height?: number; channels?: number; field_order?: string; tags?: { language?: string; title?: string } }[];
   };
   const streams = j.streams || [];
   const video = streams.find((s) => s.codec_type === 'video');
@@ -72,6 +72,7 @@ async function probe(url: string): Promise<Verdict['probe']> {
     videoCodec: video?.codec_name || '',
     audio: streams.filter((s) => s.codec_type === 'audio').map((s) => ({ codec: s.codec_name || '', language: s.tags?.language || 'und', channels: s.channels || 0 })),
     subtitles: streams.filter((s) => s.codec_type === 'subtitle').map((s) => s.tags?.language || s.tags?.title || 'und'),
+    interlaced: !!video?.field_order && !['progressive', 'unknown'].includes(video.field_order),
   };
 }
 

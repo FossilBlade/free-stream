@@ -92,6 +92,8 @@ export interface Verdict {
     videoCodec: string;
     audio: { codec: string; language: string; channels: number }[];
     subtitles: string[];
+    /** Interlaced video (TV broadcast captures); browsers can't decode interlaced H.264 repackaged as MP4. */
+    interlaced?: boolean;
   } | null;
   runtimeCheck: 'ok' | 'short' | 'long' | 'unknown';
   fileIssues: string[];
