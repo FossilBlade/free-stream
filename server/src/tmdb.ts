@@ -629,3 +629,8 @@ const GENRE_NAMES_BY_ID: Record<number, string> = {
 };
 export const genreName = (id: number) => GENRE_NAMES_BY_ID[id] || '';
 export const languageName = langName;
+
+/** Health check: a fresh (uncached) request that only succeeds with a working key. */
+export async function ping(): Promise<void> {
+  await tmdb('/configuration', { _: Date.now() });
+}

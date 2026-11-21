@@ -68,6 +68,8 @@ export interface Episode {
   airDate: string | null;
   progress: number;
   download: EpisodeDownload | null;
+  /** The source this episode plays from: its own choice (own) or the season pack. */
+  source: { releaseTitle: string; infoHash: string | null; own: boolean } | null;
 }
 
 export interface MediaRef {
@@ -183,7 +185,7 @@ export interface MediaInfo {
   videoCodec: string;
   width: number;
   height: number;
-  audio: { codec: string; language: string; channels: number }[];
+  audio: { codec: string; language: string; channels: number; title?: string; default?: boolean }[];
   container: string;
   /** Interlaced (TV broadcast) video: must be re-encoded when converting for a browser. */
   interlaced: boolean;
@@ -264,6 +266,20 @@ export interface Settings {
   hasFfmpeg?: boolean;
 }
 
+export interface HealthCheck {
+  id: string;
+  name: string;
+  status: 'ok' | 'warn' | 'fail';
+  detail: string;
+  fix?: string;
+}
+
+export interface HealthReport {
+  at: number;
+  status: 'ok' | 'warn' | 'fail';
+  checks: HealthCheck[];
+}
+
 export interface SuggestionStatus {
   profileId: string;
   name: string;
@@ -339,7 +355,9 @@ const qs = (o: Record<string, string | number | undefined>) =>
     .join('&');
 
 export const api = {
-  status: () => get<{ tmdbConfigured: boolean; indexerConfigured: boolean; indexerType: string }>('/status'),
+  status: () => get<{ tmdbConfigured: boolean; indexerConfigured: boolean; indexerType: string; health: HealthReport['status'] | null }>('/status'),
+  health: () => get<HealthReport>('/doctor'),
+  runHealthCheck: () => request<HealthReport>('POST', '/doctor'),
   home: () => get<{ continueWatching: Progress[]; myList: (MediaRef & { addedAt: number })[]; suggestions: Row[]; rows: Row[] }>('/home'),
   similar: (type: MediaType, id: number) => get<{ results: Card[] }>(`/title/${type}/${id}/similar`),
   notInterested: (type: MediaType, id: number) => request('POST', '/suggestions/not-interested', { mediaType: type, tmdbId: id }),
@@ -376,7 +394,7 @@ export const api = {
   sources: (p: { type: MediaType; id?: number; title: string; year?: string; season?: number; episode?: number; screen?: number; dolby?: 0 | 1 }) =>
     get<{ releases: Release[]; skipped: string[]; canConvert?: boolean }>(`/sources?${qs(p)}`),
   prewarm: (b: { mediaType: MediaType; tmdbId: number; season?: number }) => request<{ ok: boolean }>('POST', '/prewarm', b),
-  forgetSource: (type: MediaType, id: number, season?: number) => request('DELETE', `/sources/${type}/${id}?${qs({ season })}`),
+  forgetSource: (type: MediaType, id: number, season?: number, episode?: number) => request('DELETE', `/sources/${type}/${id}?${qs({ season, episode })}`),
   play: (b: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource }) =>
     request<PlayInfo>('POST', '/play', b),
   preview: (b: { source: SavedSource; season?: number; episode?: number; mediaType?: MediaType; tmdbId?: number }) => request<PlayInfo & { fileSize: number }>('POST', '/preview', b),
@@ -409,8 +427,8 @@ export const api = {
 
 export const streamUrl = (p: PlayInfo, preview = false) => `/api/stream/${p.infoHash}/${p.fileIdx}${preview ? '?preview' : ''}`;
 /** ffmpeg-converted stream starting at `start` seconds (fragmented MP4; seeking restarts it). */
-export const convertUrl = (p: PlayInfo, start: number, video: 'copy' | 'h264', preview = false) =>
-  `/api/convert/${p.infoHash}/${p.fileIdx}?start=${start.toFixed(3)}&video=${video}${preview ? '&preview' : ''}`;
+export const convertUrl = (p: PlayInfo, start: number, video: 'copy' | 'h264', preview = false, audio = 0, acodec: 'aac' | 'ac3' = 'aac') =>
+  `/api/convert/${p.infoHash}/${p.fileIdx}?start=${start.toFixed(3)}&video=${video}&audio=${audio}&acodec=${acodec}${preview ? '&preview' : ''}`;
 
 export const releaseSource = (r: Release): SavedSource => ({ magnet: r.magnet, downloadUrl: r.downloadUrl, infoHash: r.infoHash, releaseTitle: r.title });
 export const saveFileUrl = (hash: string, fileIdx: number) => `/api/downloads/${hash}/file?file=${fileIdx}`;

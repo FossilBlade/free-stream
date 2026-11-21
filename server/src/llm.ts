@@ -103,29 +103,62 @@ function parseVerdict(text: string): AiVerdict {
   return { ...v, confidence: Math.max(0, Math.min(1, v.confidence)) };
 }
 
-async function postJson(url: string, body: unknown, headers: Record<string, string>, timeoutMs: number): Promise<unknown> {
-  let res: Response;
+/** The human message from a provider's error body (Google wraps it in a list: [{"error":{...}}]). */
+function errorMessage(text: string): string {
   try {
-    res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
-  } catch (e) {
-    const err = e as Error;
-    throw new LlmError(err.name === 'TimeoutError' ? `No answer within ${Math.round(timeoutMs / 1000)}s.` : `Couldn't reach ${new URL(url).host}: ${err.message}`);
-  }
-  const text = await res.text();
-  if (!res.ok) {
-    let msg = text.slice(0, 300);
-    try {
-      const j = JSON.parse(text);
-      msg = j.error?.message || j.error || msg;
-    } catch {
-      /* keep raw text */
-    }
-    throw new LlmError(`${res.status}: ${msg}`);
-  }
-  try {
-    return JSON.parse(text);
+    let j = JSON.parse(text);
+    if (Array.isArray(j)) j = j[0];
+    const e = j?.error ?? j;
+    const msg = typeof e === 'string' ? e : e?.message;
+    if (msg) return String(msg).trim();
   } catch {
-    throw new LlmError('Unexpected non-JSON response.');
+    /* not JSON */
+  }
+  return text.slice(0, 300).trim();
+}
+
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * POST JSON within one time budget (`timeoutMs` covers all attempts). A busy or rate-limited provider
+ * (429/5xx) is retried after a short wait while enough of the budget is left.
+ */
+async function postJson(url: string, body: unknown, headers: Record<string, string>, timeoutMs: number): Promise<unknown> {
+  const host = new URL(url).host;
+  const deadline = Date.now() + timeoutMs;
+  let lastBusy = '';
+  for (let attempt = 0; ; attempt++) {
+    const left = deadline - Date.now();
+    let res: Response;
+    try {
+      res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal: AbortSignal.timeout(Math.max(1000, left)) });
+    } catch (e) {
+      const err = e as Error;
+      if (err.name === 'TimeoutError') {
+        throw new LlmError(`No answer within ${Math.round(timeoutMs / 1000)}s${lastBusy ? ` (earlier attempts: ${lastBusy})` : ''}. The model may be overloaded; try again later, or set a different model.`);
+      }
+      throw new LlmError(`Couldn't reach ${host}: ${err.message}`);
+    }
+    const text = await res.text();
+    if (res.ok) {
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new LlmError('Unexpected non-JSON response.');
+      }
+    }
+    const msg = errorMessage(text);
+    const wait = (attempt + 1) * 3000;
+    if (RETRYABLE.has(res.status) && attempt < 2 && deadline - Date.now() > wait + 10000) {
+      lastBusy = `${res.status} ${msg}`.slice(0, 160);
+      await new Promise((r) => setTimeout(r, wait));
+      continue;
+    }
+    if (res.status === 503 || res.status === 529) throw new LlmError(`The model is overloaded right now (${res.status}): ${msg} Try again in a minute, or set a different model.`);
+    if (res.status === 429) throw new LlmError(`Rate limit or quota reached (429): ${msg}`);
+    if (res.status === 401 || res.status === 403) throw new LlmError(`The API key was rejected (${res.status}): ${msg}`);
+    if (res.status === 404) throw new LlmError(`Model or address not found (404): ${msg} Check the model name.`);
+    throw new LlmError(`${res.status}: ${msg}`);
   }
 }
 
@@ -156,7 +189,7 @@ async function judgeOllama(input: JudgeInput): Promise<JudgeResult> {
 
 // --- Remote: OpenAI-compatible chat API (Google Gemini, OpenAI, xAI, OpenRouter, custom) ---
 
-async function judgeOpenAiCompatible(provider: RemoteProvider, input: JudgeInput): Promise<JudgeResult> {
+async function judgeOpenAiCompatible(provider: RemoteProvider, input: JudgeInput, timeoutMs = 90000): Promise<JudgeResult> {
   const s = getSettings();
   const cfg = REMOTE[provider];
   const baseUrl = provider === 'custom' ? s.aiRemoteBaseUrl : cfg.baseUrl;
@@ -179,7 +212,7 @@ async function judgeOpenAiCompatible(provider: RemoteProvider, input: JudgeInput
       response_format: { type: 'json_schema', json_schema: { name: 'verdict', strict: true, schema: VERDICT_JSON_SCHEMA } },
     },
     s.aiRemoteApiKey ? { authorization: `Bearer ${s.aiRemoteApiKey}` } : {},
-    90000,
+    timeoutMs,
   )) as { choices?: { message?: { content?: string | null; refusal?: string | null } }[] };
   const msg = data.choices?.[0]?.message;
   if (msg?.refusal) throw new LlmError(`The model declined: ${msg.refusal}`);
@@ -226,9 +259,9 @@ async function judgeAnthropic(input: JudgeInput): Promise<JudgeResult> {
   }
 }
 
-function judgeRemote(input: JudgeInput): Promise<JudgeResult> {
+function judgeRemote(input: JudgeInput, timeoutMs?: number): Promise<JudgeResult> {
   const p = getSettings().aiRemoteProvider;
-  return p === 'anthropic' ? judgeAnthropic(input) : judgeOpenAiCompatible(p, input);
+  return p === 'anthropic' ? judgeAnthropic(input) : judgeOpenAiCompatible(p, input, timeoutMs);
 }
 
 /** "Unsure" answers worth a second opinion from the remote model in local+remote mode. */
@@ -261,7 +294,8 @@ export async function testJudge(which: 'local' | 'remote'): Promise<{ ok: boolea
     frames: [],
   };
   try {
-    const r = which === 'local' ? await judgeOllama(sample) : await judgeRemote(sample);
+    // The Settings button shouldn't spin for minutes: remote tests get 45 s including retries.
+    const r = which === 'local' ? await judgeOllama(sample) : await judgeRemote(sample, 45000);
     const ok = r.verdict.match && r.verdict.kind === 'full_release';
     return { ok, ms: Date.now() - started, message: `${r.provider} (${r.model}) answered in ${((Date.now() - started) / 1000).toFixed(1)}s: “${r.verdict.summary}”${ok ? '' : ' — unexpected verdict for a known-good file.'}` };
   } catch (e) {

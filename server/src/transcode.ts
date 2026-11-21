@@ -26,9 +26,10 @@ export interface MediaInfo {
   videoCodec: string;
   width: number;
   height: number;
-  audio: { codec: string; language: string; channels: number }[];
+  audio: { codec: string; language: string; channels: number; title?: string; default?: boolean }[];
   container: string;
   interlaced: boolean;
+  videoDelaySec: number;
 }
 
 const probes = new Map<string, Promise<NonNullable<Verdict['probe']>>>();
@@ -57,6 +58,7 @@ export async function mediaInfo(infoHash: string, fileIdx: number, fileName: str
     audio: r.audio,
     container: (fileName.split('.').pop() || '').toLowerCase(),
     interlaced: !!r.interlaced,
+    videoDelaySec: r.videoDelaySec || 0,
   };
 }
 
@@ -92,7 +94,7 @@ const MAX_RUNNING = 3;
 export async function transcode(
   req: Request,
   res: Response,
-  p: { infoHash: string; fileIdx: number; start: number; video: 'copy' | 'h264'; audioTrack: number; videoCodec: string; interlaced: boolean; preview: boolean },
+  p: { infoHash: string; fileIdx: number; start: number; video: 'copy' | 'h264'; audioTrack: number; videoCodec: string; interlaced: boolean; videoDelaySec: number; preview: boolean; audioCodec: 'aac' | 'ac3'; audioChannels: number },
 ): Promise<void> {
   const key = `${p.infoHash}:${p.fileIdx}`;
   // Copied video starts on a keyframe; start the audio there too so they stay in sync.
@@ -112,7 +114,17 @@ export async function transcode(
     p.video === 'copy'
       ? ['-c:v', 'copy', ...(p.videoCodec === 'hevc' ? ['-tag:v', 'hvc1'] : [])]
       : // Re-encode (≈2–3× real time for 1080p on an 8-core M1); broadcast captures are deinterlaced too.
-        ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-pix_fmt', 'yuv420p', '-vf', `${p.interlaced ? 'yadif,' : ''}scale=-2:'min(1080,ih)'`, '-g', '96'];
+        // No B-frames: they'd delay the video track against the audio, exactly as copied B-frames do.
+        ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22', '-bf', '0', '-pix_fmt', 'yuv420p', '-vf', `${p.interlaced ? 'yadif,' : ''}scale=-2:'min(1080,ih)'`, '-g', '96'];
+  // Copied video with B-frames starts late by its reorder delay (MP4 can't start it earlier), so delay the
+  // audio by the same amount; otherwise the sound runs 40–80 ms ahead of the picture.
+  // The encoder itself adds a little delay (AAC ~21 ms, AC3 ~5 ms at 48 kHz), so take that off.
+  const encoderDelayMs = p.audioCodec === 'ac3' ? 5 : 21;
+  const delayMs = p.video === 'copy' ? Math.max(0, Math.round(p.videoDelaySec * 1000 - encoderDelayMs)) : 0;
+  // AAC stereo plays everywhere; devices that decode Dolby (TVs, Safari) keep 5.1 surround as AC3.
+  const audioArgs =
+    p.audioCodec === 'ac3' ? ['-c:a', 'ac3', '-b:a', '448k', ...(p.audioChannels > 6 ? ['-ac', '6'] : [])] : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'];
+  const audioFilter = delayMs > 0 ? ['-af', `adelay=delays=${delayMs}:all=1`] : [];
   const args = [
     '-v', 'error',
     '-rw_timeout', '60000000',
@@ -121,7 +133,8 @@ export async function transcode(
     '-map', '0:v:0',
     '-map', `0:a:${p.audioTrack}?`,
     ...videoArgs,
-    '-c:a', 'aac', '-b:a', '192k', '-ac', '2',
+    ...audioFilter,
+    ...audioArgs,
     '-sn', '-dn',
     '-avoid_negative_ts', 'make_zero',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',

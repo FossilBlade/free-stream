@@ -1,5 +1,5 @@
 import { parseRelease, playability, stripSiteTag, type Playability, type ReleaseInfo } from './release.ts';
-import { getSettings, type MediaType } from './store.ts';
+import { db, getSettings, save, type MediaType } from './store.ts';
 
 export interface Release {
   title: string;
@@ -266,6 +266,25 @@ export function score(r: Release, req: SearchRequest): number {
   return seeds + PLAY_SCORE[devicePlayability(r, req.dolby, req.canConvert)] * 6 + resolutionFit(r.info.resolution, req.screen) * 3 + exactEpisode + langBonus - sizePenalty - theaterPenalty;
 }
 
+/** Remembers whether each indexer answered (one entry per search, last 10 kept) for the health check. */
+function recordIndexerHealth(results: { label: string; result: PromiseSettledResult<unknown> }[]): void {
+  const byIndexer = new Map<string, { ok: boolean; error?: string }>();
+  for (const { label, result } of results) {
+    const cur = byIndexer.get(label) || { ok: false };
+    if (result.status === 'fulfilled') cur.ok = true;
+    else cur.error ||= (result.reason as Error).message;
+    byIndexer.set(label, cur);
+  }
+  const health = (db.indexerHealth ||= {});
+  for (const [name, r] of byIndexer) {
+    const h = (health[name] ||= { recent: [], lastAt: 0 });
+    h.recent = [...h.recent, r.ok ? 1 : 0].slice(-10);
+    h.lastAt = Date.now();
+    if (!r.ok) h.lastError = r.error;
+  }
+  save();
+}
+
 export interface SearchResult {
   releases: Release[];
   /** Indexers that failed or were too slow, e.g. "Internet Archive (timed out after 25s)". */
@@ -288,6 +307,7 @@ export async function searchReleases(req: SearchRequest): Promise<SearchResult> 
       for (const ix of indexers) for (const q of qs) jobs.push({ label: ix.name, run: () => prowlarrOne(ix.id, q, req.mediaType) });
     }
     const settledResults = await Promise.allSettled(jobs.map((j) => j.run()));
+    recordIndexerHealth(jobs.map((j, i) => ({ label: j.label, result: settledResults[i] })));
     const skipped = new Set<string>();
     settledResults.forEach((r, i) => {
       if (r.status === 'rejected') skipped.add(`${jobs[i].label} (${(r.reason as Error).message})`);

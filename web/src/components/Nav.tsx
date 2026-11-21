@@ -38,6 +38,7 @@ export function Nav() {
   const { pathname } = useLocation();
   const [solid, setSolid] = useState(false);
   const [unseen, setUnseen] = useState(0);
+  const [healthFail, setHealthFail] = useState(false);
   const isKidProfile = useProfile().isKid;
 
   // Green dot on the bell when something being watched was found.
@@ -50,6 +51,19 @@ export function Nav() {
         .catch(() => {});
     check();
     const t = setInterval(check, 60000);
+    return () => clearInterval(t);
+  }, [pathname, isKidProfile]);
+
+  // Red dot on Settings when the background health check found a failure (adults only).
+  useEffect(() => {
+    if (isKidProfile) return;
+    const check = () =>
+      api
+        .status()
+        .then((r) => setHealthFail(r.health === 'fail'))
+        .catch(() => {});
+    check();
+    const t = setInterval(check, 5 * 60000);
     return () => clearInterval(t);
   }, [pathname, isKidProfile]);
 
@@ -78,6 +92,7 @@ export function Nav() {
     >
       {i.icon}
       {i.path === '/watching' && unseen > 0 && <span className="nav-dot" aria-label={`${unseen} found`} />}
+      {i.path === '/settings' && healthFail && <span className="nav-dot nav-dot-bad" aria-label="Health check found a problem" />}
       <span className={i.iconOnly && !(phone && inBottom(i)) ? 'sr-only' : 'nav-label'}>{i.label}</span>
     </Focusable>
   );

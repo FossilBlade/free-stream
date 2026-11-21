@@ -47,8 +47,12 @@ export function Message({ title, children, action }: { title: string; children?:
   );
 }
 
-export function Badge({ children, tone = 'plain' }: { children: ReactNode; tone?: 'plain' | 'good' | 'ok' | 'risky' | 'accent' }) {
-  return <span className={`badge badge-${tone}`}>{children}</span>;
+export function Badge({ children, tone = 'plain', title }: { children: ReactNode; tone?: 'plain' | 'good' | 'ok' | 'risky' | 'accent'; title?: string }) {
+  return (
+    <span className={`badge badge-${tone}`} title={title}>
+      {children}
+    </span>
+  );
 }
 
 export function ProgressBar({ value }: { value: number }) {

@@ -38,6 +38,9 @@ import {
   progressKey,
   save,
   sourceKey,
+  episodeSourceKey,
+  rememberSource,
+  sourceFor,
   type MediaRef,
   type MediaType,
   type Progress,
@@ -47,6 +50,7 @@ import {
 } from './store.ts';
 import { shiftVtt, srtToVtt } from './subtitles.ts';
 import { keyframeAt, mediaInfo, setTranscodeBaseUrl, transcode } from './transcode.ts';
+import { doctor, startDoctor } from './doctor.ts';
 import * as tmdb from './tmdb.ts';
 import {
   addSource,
@@ -68,6 +72,7 @@ import {
   startDownload,
   listDownloads,
   pickFile,
+  isSeasonPack,
   readFileText,
   shutdown,
   statusOf,
@@ -124,7 +129,18 @@ async function titleFor(type: MediaType, id: number): Promise<{ folder?: string;
 
 app.get('/api/status', (_req, res) => {
   const s = getSettings();
-  res.json({ tmdbConfigured: !!s.tmdbApiKey, indexerConfigured: !!s.indexerApiKey, indexerType: s.indexerType });
+  // `health` drives the red dot on the Settings icon (adults only; the details need the parent PIN).
+  res.json({ tmdbConfigured: !!s.tmdbApiKey, indexerConfigured: !!s.indexerApiKey, indexerType: s.indexerType, health: db.health?.status || null });
+});
+
+/** Last health check (runs one if there's none yet). */
+app.get('/api/doctor', parentOnly, async (_req, res) => {
+  res.json(db.health || (await doctor()));
+});
+
+/** Run the health check now. */
+app.post('/api/doctor', parentOnly, async (_req, res) => {
+  res.json(await doctor());
 });
 
 app.get('/api/settings', parentOnly, (_req, res) => {
@@ -353,6 +369,11 @@ app.get('/api/title/tv/:id/season/:n', async (req, res) => {
         ...e,
         progress: p ? Math.min(1, p.position / (p.duration || 1)) : 0,
         download: dl ? { infoHash: dl.infoHash, fileIdx: dl.fileIdx, progress: dl.progress, complete: dl.complete, downloading: dl.downloading } : null,
+        // The source this episode would play from (its own choice, else the season pack).
+        source: (() => {
+          const src = sourceFor('tv', id, n, e.number);
+          return src ? { releaseTitle: src.releaseTitle, infoHash: src.infoHash || null, own: !!db.sources[episodeSourceKey(id, n, e.number)] } : null;
+        })(),
       };
     }),
     savedSource: db.sources[sourceKey('tv', id, n)] || null,
@@ -463,10 +484,9 @@ app.post('/api/play', async (req, res) => {
   const tmdbId = int(b.tmdbId, 'tmdbId');
   const season = optInt(b.season, 'season');
   const episode = optInt(b.episode, 'episode');
-  const sKey = sourceKey(type, tmdbId, season);
   await requireAllowed(res, type, tmdbId);
   // Kids just press Play: FreeStream picks a verified source itself (never a theater copy).
-  const source = isKid(res) ? await autoSource(type, tmdbId, season, episode) : b.source || db.sources[sKey];
+  const source = isKid(res) ? await autoSource(type, tmdbId, season, episode) : b.source || sourceFor(type, tmdbId, season, episode);
   if (!source) throw new HttpError(409, isKid(res) ? 'This one isn’t ready yet — ask a grown-up to set it up.' : 'No source chosen yet.');
 
   const t = await addSource(source, await titleFor(type, tmdbId));
@@ -474,7 +494,7 @@ app.post('/api/play', async (req, res) => {
   prioritizeEdges(t, fileIdx);
   markPlayed(t.infoHash);
   rememberFile(t, fileIdx, { season, episode });
-  db.sources[sKey] = { magnet: source.magnet, downloadUrl: source.downloadUrl, infoHash: t.infoHash, releaseTitle: source.releaseTitle || t.name };
+  rememberSource(type, tmdbId, { magnet: source.magnet, downloadUrl: source.downloadUrl, infoHash: t.infoHash, releaseTitle: source.releaseTitle || t.name }, { season, episode, seasonPack: isSeasonPack(t) });
   watchForUpgrade(type, tmdbId, t.infoHash, source.releaseTitle || t.name, season, episode);
   save();
 
@@ -516,14 +536,13 @@ app.post('/api/download', adultsOnly, async (req, res) => {
   const tmdbId = int(b.tmdbId, 'tmdbId');
   const season = optInt(b.season, 'season');
   const episode = optInt(b.episode, 'episode');
-  const sKey = sourceKey(type, tmdbId, season);
-  const source = b.source || db.sources[sKey];
+  const source = b.source || sourceFor(type, tmdbId, season, episode);
   if (!source) throw new HttpError(409, 'No source chosen yet.');
 
   const t = await addSource(source, await titleFor(type, tmdbId));
   const fileIdx = pickFile(t, season, episode);
   const status = startDownload(t, fileIdx, { season, episode });
-  db.sources[sKey] = { magnet: source.magnet, downloadUrl: source.downloadUrl, infoHash: t.infoHash, releaseTitle: source.releaseTitle || t.name };
+  rememberSource(type, tmdbId, { magnet: source.magnet, downloadUrl: source.downloadUrl, infoHash: t.infoHash, releaseTitle: source.releaseTitle || t.name }, { season, episode, seasonPack: isSeasonPack(t) });
   watchForUpgrade(type, tmdbId, t.infoHash, source.releaseTitle || t.name, season, episode);
   save();
   res.json({ status, infoHash: t.infoHash, fileIdx, fileName: t.files[fileIdx].name });
@@ -531,18 +550,27 @@ app.post('/api/download', adultsOnly, async (req, res) => {
 
 /** Title page opened: connect to the remembered source's peers now, so Play starts faster. */
 app.post('/api/prewarm', async (req, res) => {
-  const b = req.body as { mediaType: MediaType; tmdbId: number; season?: number };
+  const b = req.body as { mediaType: MediaType; tmdbId: number; season?: number; episode?: number };
   const type = mediaType(b.mediaType);
   const tmdbId = int(b.tmdbId, 'tmdbId');
-  const source = db.sources[sourceKey(type, tmdbId, optInt(b.season, 'season'))];
+  const source = sourceFor(type, tmdbId, optInt(b.season, 'season'), optInt(b.episode, 'episode'));
   if (source) prewarm(source, await titleFor(type, tmdbId));
   res.json({ ok: !!source });
 });
 
 /** Forget the remembered source (e.g. it doesn't play) so the user can pick another. */
 app.delete('/api/sources/:type/:id', adultsOnly, (req, res) => {
-  const key = sourceKey(mediaType(req.params.type), int(req.params.id, 'id'), optInt(req.query.season, 'season'));
-  delete db.sources[key];
+  const type = mediaType(req.params.type);
+  const id = int(req.params.id, 'id');
+  const season = optInt(req.query.season, 'season');
+  const episode = optInt(req.query.episode, 'episode');
+  if (type === 'tv' && season != null && episode != null) {
+    // Just this episode. The season's pack stays for the other episodes, unless it's this episode's single file.
+    const own = db.sources[episodeSourceKey(id, season, episode)];
+    delete db.sources[episodeSourceKey(id, season, episode)];
+    const seasonSrc = db.sources[sourceKey('tv', id, season)];
+    if (seasonSrc && (!own || own.infoHash === seasonSrc.infoHash) && !parseRelease(seasonSrc.releaseTitle).pack) delete db.sources[sourceKey('tv', id, season)];
+  } else delete db.sources[sourceKey(type, id, season)];
   save();
   res.json({ ok: true });
 });
@@ -668,7 +696,10 @@ app.get('/api/convert/:hash/:idx', async (req, res) => {
     audioTrack: Math.max(0, optInt(req.query.audio, 'audio') || 0),
     videoCodec: info?.videoCodec || '',
     interlaced: !!info?.interlaced,
+    videoDelaySec: info?.videoDelaySec || 0,
     preview,
+    audioCodec: req.query.acodec === 'ac3' ? 'ac3' : 'aac',
+    audioChannels: info?.audio[Math.max(0, optInt(req.query.audio, 'audio') || 0)]?.channels || 2,
   });
 });
 
@@ -808,6 +839,7 @@ setSelfBaseUrl(`http://127.0.0.1:${PORT}`);
 setTranscodeBaseUrl(`http://127.0.0.1:${PORT}`);
 startWatcher();
 startSuggestions();
+startDoctor();
 
 // Theater copies chosen before upgrade-watching existed: start looking for proper versions of those too.
 setTimeout(() => {

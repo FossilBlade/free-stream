@@ -6,7 +6,7 @@
  */
 import { searchReleases, type Release } from './indexers.ts';
 import { parseRelease } from './release.ts';
-import { db, getSettings, save, sourceKey, type MediaType, type SavedSource, type Watch } from './store.ts';
+import { db, episodeSourceKey, getSettings, rememberSource, save, sourceFor, type MediaType, type SavedSource, type Watch } from './store.ts';
 import * as tmdb from './tmdb.ts';
 import { addSource, pickFile, startDownload } from './torrents.ts';
 import { deepCheck, verdictForHash } from './verify.ts';
@@ -128,7 +128,7 @@ async function process(w: Watch): Promise<void> {
       if (getSettings().watchAutoDownload) {
         const t = await addSource(w.found.source, { mediaType: w.mediaType, tmdbId: w.tmdbId, title: d.year ? `${d.title} (${d.year})` : d.title });
         startDownload(t, pickFile(t, w.season, w.episode), { season: w.season, episode: w.episode });
-        db.sources[sourceKey(w.mediaType, w.tmdbId, w.season)] = w.found.source;
+        rememberSource(w.mediaType, w.tmdbId, w.found.source, { season: w.season, episode: w.episode, seasonPack: parseRelease(w.found.source.releaseTitle).pack });
         w.downloaded = true;
         w.note = `Found and downloading: ${v.label}`;
       }
@@ -177,8 +177,9 @@ export function startWatcher(): void {
  * that passes the deep check (never a theater copy). Null when nothing suitable exists yet.
  */
 export async function autoSource(type: MediaType, tmdbId: number, season?: number, episode?: number): Promise<SavedSource | null> {
-  const key = sourceKey(type, tmdbId, season);
-  const saved = db.sources[key];
+  let saved = sourceFor(type, tmdbId, season, episode);
+  // A season's remembered single-episode torrent can't serve this episode.
+  if (saved && type === 'tv' && season != null && episode != null && !db.sources[episodeSourceKey(tmdbId, season, episode)] && !parseRelease(saved.releaseTitle).pack) saved = undefined;
   if (saved?.infoHash) {
     const v = verdictForHash(saved.infoHash);
     if (!parseRelease(saved.releaseTitle).theater && v?.outcome !== 'theater' && v?.outcome !== 'rejected') return saved;
@@ -193,7 +194,7 @@ export async function autoSource(type: MediaType, tmdbId: number, season?: numbe
       const v = await deepCheck({ source, mediaType: type, tmdbId, season, episode, release: { size: r.size, seeders: r.seeders, indexer: r.indexer } });
       if (v.outcome !== 'verified') continue;
       const chosen = { ...source, infoHash: v.infoHash };
-      db.sources[key] = chosen;
+      rememberSource(type, tmdbId, chosen, { season, episode, seasonPack: r.info.pack });
       save();
       return chosen;
     } catch {

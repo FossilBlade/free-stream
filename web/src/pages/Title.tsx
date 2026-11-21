@@ -1,5 +1,5 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
-import { Bell, BellRing, CalendarClock, Check, CheckCircle2, Clapperboard, Download, Link2, ListPlus, Play, Sparkles, Star, ThumbsDown } from 'lucide-react';
+import { Bell, BellRing, CalendarClock, Check, CheckCircle2, Clapperboard, Download, Link2, ListPlus, ListVideo, Play, Sparkles, Star, ThumbsDown } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, downloadMessage, formatRuntime, img, shortDate, todayIso, type Card, type Details, type DownloadRow, type Episode, type MediaType, type Progress, type SavedSource, type Verdict, type Watch } from '../api';
@@ -33,7 +33,6 @@ export function Title() {
 
   const [season, setSeason] = useState<number | null>(null);
   const [episodes, setEpisodes] = useState<Episode[] | null>(null);
-  const [seasonSource, setSeasonSource] = useState<SavedSource | null>(null);
   /** Downloads of this title (movie) or of the selected season (show). */
   const [downloads, setDownloads] = useState<DownloadRow[]>([]);
 
@@ -97,7 +96,6 @@ export function Title() {
         .season(id, n)
         .then((r) => {
           setEpisodes(r.episodes);
-          setSeasonSource(r.savedSource);
           setDownloads(r.downloads);
         })
         .catch(() => !quiet && setEpisodes([]));
@@ -180,16 +178,18 @@ export function Title() {
     [details, type, id, navigate, openPicker, isKid],
   );
 
-  /** Plays an episode: from its finished download if there is one, else the season's source (or pick one). */
+  /**
+   * Plays an episode: from its finished download if there is one, else its own source or the season pack.
+   * The server answers 409/422 when there's nothing suitable, and play() then opens the list for that episode.
+   */
   const playEpisode = useCallback(
     (n: number, e: number) => {
       if (isKid) return void play({ season: n, episode: e }); // the server picks a verified source
       const ep = n === season ? episodes?.find((x) => x.number === e) : undefined;
       if (ep?.download?.complete) play({ season: n, episode: e }, { infoHash: ep.download.infoHash, releaseTitle: 'Downloaded file' });
-      else if (n !== season || seasonSource) play({ season: n, episode: e });
-      else openPicker({ season: n, episode: e }, 'play');
+      else play({ season: n, episode: e });
     },
-    [season, episodes, seasonSource, play, openPicker, isKid],
+    [season, episodes, play, isKid],
   );
 
   /** Play: a finished download first, then the remembered source, else pick one. */
@@ -270,11 +270,11 @@ export function Title() {
     else playEpisode(details?.seasons[0]?.number ?? 1, 1);
   };
 
-  const changeSource = async () => {
-    const t = mainTarget();
-    await api.forgetSource(type, id, t.season);
+  /** Change source: for a show, only the episode it's about (the season pack stays for the others). */
+  const changeSource = async (t: Target = mainTarget()) => {
+    await api.forgetSource(type, id, t.season, t.episode);
     if (type === 'movie') setMovieSource(null);
-    else setSeasonSource(null);
+    else if (t.season != null) loadSeason(t.season, true);
     openPicker(t, 'play');
   };
 
@@ -290,7 +290,10 @@ export function Title() {
         ? `Resume · ${Math.max(1, Math.round((lastWatched!.duration - lastWatched!.position) / 60))}m left`
         : 'Play';
 
-  const currentSource = type === 'movie' ? movieSource : seasonSource;
+  // For a show: the source of the episode Play would start (its own, or the season pack).
+  const targetEpisode = type === 'tv' && target.season === season ? episodes?.find((e) => e.number === target.episode) : undefined;
+  const currentSource: SavedSource | null =
+    type === 'movie' ? movieSource : targetEpisode?.source ? { releaseTitle: targetEpisode.source.releaseTitle, infoHash: targetEpisode.source.infoHash || undefined } : null;
   const release = details.release;
   /** Something to play already: a source or a finished download. */
   const hasCopy = !!(currentSource || completeDl);
@@ -365,7 +368,9 @@ export function Title() {
                   {busy ? 'Starting…' : playLabel}
                 </Button>
               ))}
-            {release.state !== 'coming' &&
+            {/* Shows download per source (in each episode's source list), not per title. */}
+            {type === 'movie' &&
+              release.state !== 'coming' &&
               (release.state !== 'theaters' || hasCopy) &&
               (completeDl ? (
                 <Button icon={<CheckCircle2 />} scroll="top" className="btn-done" onSelect={() => navigate('/downloads')}>
@@ -429,7 +434,7 @@ export function Title() {
                 </Focusable>
               )}
               {currentSource && (
-                <Focusable className="link-btn" scroll="top" onSelect={changeSource}>
+                <Focusable className="link-btn" scroll="top" onSelect={() => changeSource()}>
                   Change source
                 </Focusable>
               )}
@@ -476,6 +481,16 @@ export function Title() {
                       <p className="muted">{e.overview}</p>
                     </div>
                   </Focusable>
+                  {!isKid && (
+                    <Focusable
+                      className="btn btn-secondary btn-icon episode-source"
+                      disabled={busy}
+                      title={e.source ? `Source: ${e.source.releaseTitle} — choose another or preview` : 'Choose a source (with preview)'}
+                      onSelect={() => openPicker({ season: season!, episode: e.number }, 'play')}
+                    >
+                      <ListVideo />
+                    </Focusable>
+                  )}
                   {isKid ? null : e.download?.complete ? (
                     <Focusable className="btn btn-secondary btn-icon episode-download is-done" disabled={busy} title="On this Mac — play it" onSelect={() => playEpisode(season!, e.number)}>
                       <CheckCircle2 />
@@ -484,11 +499,7 @@ export function Title() {
                     <Focusable className="btn btn-secondary episode-download is-progress" title="Downloading" onSelect={() => navigate('/downloads')}>
                       {Math.floor(e.download.progress * 100)}%
                     </Focusable>
-                  ) : (
-                    <Focusable className="btn btn-secondary btn-icon episode-download" disabled={busy} title="Download episode" onSelect={() => download({ season: season!, episode: e.number })}>
-                      <Download />
-                    </Focusable>
-                  )}
+                  ) : null}
                 </div>
               ))}
             </FocusGroup>

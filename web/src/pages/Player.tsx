@@ -1,11 +1,23 @@
 import { pause as pauseNav, resume as resumeNav } from '@noriginmedia/norigin-spatial-navigation';
-import { AlertTriangle, ArrowLeft, Captions, Maximize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, AudioLines, Captions, Maximize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, subtitleUrl, type Details, type Episode, type MediaInfo, type MediaType, type PlayInfo, type TorrentStatus } from '../api';
 import { runBackHandlers } from '../back';
 import { Spinner } from '../components/ui';
-import { canDecodeVideo, choosePlayMode, type PlayMode } from '../playback';
+import {
+  audioLabel,
+  canDecodeVideo,
+  choosePlayMode,
+  convertAudioCodec,
+  defaultAudioIndex,
+  preferredAudioIndex,
+  rememberAudio,
+  rememberedAudio,
+  supportsAudioTracks,
+  type PlayMode,
+} from '../playback';
+import { useProfile } from '../profile';
 import { isBackKey, isTV, KEY } from '../tv';
 
 const SEEK_STEP = 10;
@@ -13,8 +25,8 @@ const HIDE_AFTER_MS = 4000;
 const SAVE_EVERY_MS = 10000;
 const UP_NEXT_SECONDS = 30;
 
-type Zone = 'timeline' | 'buttons' | 'subs';
-type ButtonId = 'play' | 'back10' | 'fwd10' | 'subs' | 'next' | 'mute' | 'fullscreen';
+type Zone = 'timeline' | 'buttons' | 'subs' | 'audio';
+type ButtonId = 'play' | 'back10' | 'fwd10' | 'subs' | 'audio' | 'next' | 'mute' | 'fullscreen';
 
 export function Player() {
   const { type: typeParam, id: idParam } = useParams();
@@ -25,6 +37,7 @@ export function Player() {
   const episode = params.get('episode') ? Number(params.get('episode')) : undefined;
   const location = useLocation();
   const navigate = useNavigate();
+  const { profile } = useProfile();
 
   const video = useRef<HTMLVideoElement>(null);
   const [info, setInfo] = useState<PlayInfo | null>(null);
@@ -51,6 +64,10 @@ export function Player() {
   /** Converted streams start at `offset` seconds into the file; the video element's clock starts at 0. */
   const [offset, setOffset] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
+  /** Audio tracks in the file, and the one playing (chosen from the profile's languages). */
+  const [audioTracks, setAudioTracks] = useState<MediaInfo['audio']>([]);
+  const [audioIdx, setAudioIdx] = useState(0);
+  const [audioCursor, setAudioCursor] = useState(0);
   const modeRef = useRef<PlayMode | null>(null);
   const offsetRef = useRef(0);
   const mediaDurRef = useRef(0);
@@ -58,6 +75,8 @@ export function Player() {
   const canConvertRef = useRef(false);
   const timeRef = useRef(0);
   const pendingSeek = useRef<number | null>(null);
+  /** Where direct play should start after switching back from a converted stream (else the resume point). */
+  const directStartAt = useRef<number | null>(null);
   const seekTimer = useRef<number | undefined>(undefined);
   modeRef.current = mode;
   offsetRef.current = offset;
@@ -107,6 +126,8 @@ export function Player() {
     setMode(null);
     setOffset(0);
     setMediaDuration(0);
+    setAudioTracks([]);
+    setAudioIdx(0);
     mediaRef.current = null;
     pendingSeek.current = null;
     if (fromState) {
@@ -158,7 +179,11 @@ export function Player() {
         canConvertRef.current = r.canConvert;
         mediaRef.current = r.info;
         if (r.info?.durationSec) setMediaDuration(r.info.durationSec);
-        const m = choosePlayMode(r.info, r.canConvert);
+        // Play the profile's language (or the one chosen earlier for this show), not just the file's default.
+        const aIdx = preferredAudioIndex(r.info, profile?.languages || ['en'], rememberedAudio(type, id));
+        setAudioTracks(r.info?.audio || []);
+        setAudioIdx(aIdx);
+        const m = choosePlayMode(r.info, r.canConvert, aIdx);
         const cur = modeRef.current;
         if (!cur) {
           if (m.kind !== 'convert') return setMode(m);
@@ -174,6 +199,7 @@ export function Player() {
       live = false;
       window.clearTimeout(fallback);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [info, convertFrom]);
   useEffect(() => () => window.clearTimeout(seekTimer.current), []);
 
@@ -354,8 +380,37 @@ export function Player() {
     else el.webkitRequestFullscreen?.();
   }, []);
 
+  /** Direct play in browsers that can switch tracks themselves (Safari, some TVs). */
+  const enableNativeTrack = (i: number) => {
+    const tracks = (video.current as (HTMLVideoElement & { audioTracks?: { length: number; [n: number]: { enabled: boolean } } }) | null)?.audioTracks;
+    if (!tracks || tracks.length < 2) return false;
+    for (let n = 0; n < tracks.length; n++) tracks[n].enabled = n === i;
+    return true;
+  };
+
+  /** Audio menu choice: switch in the player when it can, otherwise restart the conversion with that track. */
+  const chooseAudio = (i: number) => {
+    setZone('buttons');
+    if (i === audioIdx) return;
+    const track = audioTracks[i];
+    if (track?.language && track.language !== 'und') rememberAudio(type, id, track.language);
+    setAudioIdx(i);
+    const m = modeRef.current;
+    if (m?.kind === 'direct' && supportsAudioTracks && enableNativeTrack(i)) return;
+    const media = mediaRef.current;
+    const next = choosePlayMode(media, canConvertRef.current, i);
+    if (next.kind === 'direct') {
+      // Back to the file's own default track: play the original again, from the same place.
+      directStartAt.current = absTime();
+      setOffset(0);
+      setMode(next);
+      return;
+    }
+    convertFrom(absTime(), m?.kind === 'convert' && m.video === 'h264' ? { ...next, video: 'h264' } : next);
+  };
+
   const subtitles = info?.subtitles || [];
-  const buttons: ButtonId[] = ['play', 'back10', 'fwd10', ...(subtitles.length ? (['subs'] as ButtonId[]) : []), ...(nextEpisode ? (['next'] as ButtonId[]) : []), ...(isTV ? [] : (['mute', 'fullscreen'] as ButtonId[]))];
+  const buttons: ButtonId[] = ['play', 'back10', 'fwd10', ...(subtitles.length ? (['subs'] as ButtonId[]) : []), ...(audioTracks.length > 1 ? (['audio'] as ButtonId[]) : []), ...(nextEpisode ? (['next'] as ButtonId[]) : []), ...(isTV ? [] : (['mute', 'fullscreen'] as ButtonId[]))];
 
   const activate = useCallback(
     (b: ButtonId) => {
@@ -365,11 +420,14 @@ export function Player() {
       else if (b === 'subs') {
         setZone('subs');
         setSubCursor(subIdx == null ? 0 : subtitles.findIndex((s) => s.idx === subIdx) + 1);
+      } else if (b === 'audio') {
+        setZone('audio');
+        setAudioCursor(audioIdx);
       } else if (b === 'next') goNext();
       else if (b === 'mute') setMuted((m) => !m);
       else if (b === 'fullscreen') toggleFullscreen();
     },
-    [togglePlay, seekBy, goNext, toggleFullscreen, subIdx, subtitles],
+    [togglePlay, seekBy, goNext, toggleFullscreen, subIdx, subtitles, audioIdx],
   );
 
   // ---- up next prompt ---------------------------------------------------------------------------------
@@ -387,7 +445,7 @@ export function Player() {
       const k = e.keyCode;
       if (isBackKey(e)) {
         e.preventDefault();
-        if (zone === 'subs') setZone('buttons');
+        if (zone === 'subs' || zone === 'audio') setZone('buttons');
         else if (!runBackHandlers()) exit();
         return;
       }
@@ -407,6 +465,15 @@ export function Player() {
 
       // While "Next episode" is offered, OK takes it (unless the user is in the button bar).
       if ((countdown != null || showUpNext) && k === KEY.ENTER && zone === 'timeline') return goNext();
+
+      if (zone === 'audio') {
+        const n = audioTracks.length;
+        if (k === KEY.UP) setAudioCursor((c) => (c - 1 + n) % n);
+        else if (k === KEY.DOWN) setAudioCursor((c) => (c + 1) % n);
+        else if (k === KEY.ENTER) chooseAudio(audioCursor);
+        else if (k === KEY.LEFT || k === KEY.RIGHT) setZone('buttons');
+        return;
+      }
 
       if (zone === 'subs') {
         const n = subtitles.length + 1; // + "Off"
@@ -439,7 +506,8 @@ export function Player() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [zone, btn, buttons, visible, fatal, countdown, showUpNext, subtitles, subCursor, poke, togglePlay, seekBy, exit, goNext, activate]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zone, btn, buttons, visible, fatal, countdown, showUpNext, subtitles, subCursor, audioTracks, audioCursor, poke, togglePlay, seekBy, exit, goNext, activate]);
 
   // Lift subtitles above the control bar while it's showing.
   useEffect(() => {
@@ -468,7 +536,12 @@ export function Player() {
     const v = video.current!;
     setDuration(totalDuration());
     // Converted streams already start at the resume point (or the seek target).
-    if (!converting && info?.resumeAt && info.resumeAt < v.duration - 10) v.currentTime = info.resumeAt;
+    if (!converting) {
+      const startAt = directStartAt.current ?? info?.resumeAt ?? 0;
+      directStartAt.current = null;
+      if (startAt && startAt < v.duration - 10) v.currentTime = startAt;
+      enableNativeTrack(audioIdx);
+    }
     v.play().catch(() => setPlaying(false));
   };
 
@@ -546,8 +619,12 @@ export function Player() {
       {info && mode && (
         <video
           ref={video}
-          key={`${info.infoHash}-${info.fileIdx}-${mode.kind}-${mode.kind === 'convert' ? `${mode.video}-${offset}` : ''}`}
-          src={mode.kind === 'convert' ? convertUrl(info, offset, mode.video) : streamUrl(info)}
+          key={`${info.infoHash}-${info.fileIdx}-${mode.kind}-${mode.kind === 'convert' ? `${mode.video}-${offset}-${mode.audio ?? 0}` : ''}`}
+          src={
+            mode.kind === 'convert'
+              ? convertUrl(info, offset, mode.video, false, mode.audio ?? 0, convertAudioCodec(audioTracks[mode.audio ?? 0]))
+              : streamUrl(info)
+          }
           autoPlay
           playsInline
           muted={muted}
@@ -671,6 +748,7 @@ export function Player() {
             {ctl('back10', <RotateCcw />, 'Back 10 seconds', <span className="pbtn-num">10</span>)}
             {ctl('fwd10', <RotateCw />, 'Forward 10 seconds', <span className="pbtn-num">10</span>)}
             {subtitles.length > 0 && ctl('subs', <Captions />, 'Subtitles')}
+            {audioTracks.length > 1 && ctl('audio', <AudioLines />, 'Audio')}
             {nextEpisode && ctl('next', <SkipForward />, 'Next episode')}
             {!isTV && ctl('mute', muted ? <VolumeX /> : <Volume2 />, muted ? 'Unmute' : 'Mute')}
             {!isTV && ctl('fullscreen', <Maximize />, 'Full screen')}
@@ -682,6 +760,23 @@ export function Player() {
         </div>
         {isTV && visible && <div className="player-hint muted small">◀ ▶ seek · OK play/pause · ▼ more controls</div>}
       </div>
+
+      {zone === 'audio' && (
+        <div className="subs-menu" onClick={(e) => e.stopPropagation()}>
+          <h3>Audio</h3>
+          {audioTracks.map((a, i) => (
+            <button
+              key={i}
+              className={`subs-item${audioCursor === i ? ' is-focused' : ''}${audioIdx === i ? ' is-on' : ''}`}
+              onMouseEnter={() => setAudioCursor(i)}
+              onClick={() => chooseAudio(i)}
+            >
+              {audioLabel(a, i)}
+              {i === defaultAudioIndex(mediaRef.current) && audioTracks.length > 1 ? <span className="muted small"> · file default</span> : null}
+            </button>
+          ))}
+        </div>
+      )}
 
       {zone === 'subs' && (
         <div className="subs-menu" onClick={(e) => e.stopPropagation()}>

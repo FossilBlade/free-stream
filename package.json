@@ -16,7 +16,8 @@
     "webos:install": "./webos/install.sh",
     "docker:up": "docker compose up -d --build && echo \"FreeStream: http://$(ipconfig getifaddr en0):${PORT:-8080}  Prowlarr: http://localhost:9696\"",
     "docker:down": "docker compose down",
-    "docker:logs": "docker compose logs -f freestream"
+    "docker:logs": "docker compose logs -f freestream",
+    "doctor": "npm run doctor -w server"
   },
   "devDependencies": {
     "concurrently": "^9.2.5"

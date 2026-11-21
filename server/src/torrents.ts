@@ -279,6 +279,12 @@ export function episodeOf(path: string): { s: number; e: number } | null {
   return m ? { s: Number(m[1]), e: Number(m[2]) } : null;
 }
 
+/** True when the torrent holds several episodes (a season pack), so it can serve the whole season. */
+export function isSeasonPack(t: Torrent): boolean {
+  const eps = new Set(t.files.filter((f) => isVideo(f)).map((f) => episodeOf(f.path)?.e).filter((e) => e != null));
+  return eps.size > 1;
+}
+
 /** Picks the video for a movie (largest) or for one episode (by SxxEyy in the file path). */
 export function pickFile(t: Torrent, season?: number, episode?: number): number {
   const videos = t.files.map((f, idx) => ({ f, idx })).filter(({ f }) => isVideo(f));
@@ -290,7 +296,10 @@ export function pickFile(t: Torrent, season?: number, episode?: number): number 
       return ep && ep.e === episode && (season == null || ep.s === season);
     });
     if (match.length) return match.sort((a, b) => b.f.length - a.f.length)[0].idx;
-    if (videos.length > 1) throw new TorrentError(`Couldn't find season ${season} episode ${episode} in this torrent.`, 422);
+    // A single video named as another episode (e.g. a season's remembered single-episode torrent) is the wrong file.
+    const named = videos.length === 1 ? episodeOf(videos[0].f.path) : null;
+    if (videos.length > 1 || (named && (named.e !== episode || (season != null && named.s !== season))))
+      throw new TorrentError(`Couldn't find season ${season} episode ${episode} in this torrent.`, 422);
   }
   return videos.sort((a, b) => b.f.length - a.f.length)[0].idx;
 }

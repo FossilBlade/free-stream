@@ -2,7 +2,8 @@ import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
 import { AlertTriangle, CheckCircle2, Download, Play, Volume2, VolumeX, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, type MediaInfo, type MediaType, type PlayInfo, type SavedSource, type TorrentStatus, type Verdict } from '../api';
-import { canDecodeVideo, choosePlayMode, type PlayMode } from '../playback';
+import { audioLabel, canDecodeVideo, choosePlayMode, convertAudioCodec, preferredAudioIndex, supportsAudioTracks, type PlayMode } from '../playback';
+import { useProfile } from '../profile';
 import { useBackHandler } from '../back';
 import { FocusGroup, Focusable } from './Focusable';
 import { Button, Spinner } from './ui';
@@ -65,6 +66,9 @@ export function PreviewModal({
   const [convertStart, setConvertStart] = useState(0);
   const media = useRef<MediaInfo | null>(null);
   const canConvert = useRef(false);
+  const { profile } = useProfile();
+  const [audioTracks, setAudioTracks] = useState<MediaInfo['audio']>([]);
+  const [audioIdx, setAudioIdx] = useState(0);
 
   /** Converted previews restart at each spot; copied video starts on the keyframe at or before it. */
   const convertAt = async (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
@@ -87,7 +91,11 @@ export function PreviewModal({
         if (!live) return;
         media.current = r.info;
         canConvert.current = r.canConvert;
-        const m = choosePlayMode(r.info, r.canConvert);
+        // Preview in the profile's language, like the player.
+        const aIdx = preferredAudioIndex(r.info, profile?.languages || ['en'], null);
+        setAudioTracks(r.info?.audio || []);
+        setAudioIdx(aIdx);
+        const m = choosePlayMode(r.info, r.canConvert, aIdx);
         if (m.kind === 'convert') {
           if (r.info?.durationSec) setDuration(r.info.durationSec);
           convertAt((r.info?.durationSec || 0) * JUMPS[0], m);
@@ -195,8 +203,31 @@ export function PreviewModal({
     }
   };
 
+  /** Direct play where the browser can switch tracks itself (Safari, some TVs). */
+  const enableNativeTrack = (i: number) => {
+    const tracks = (video.current as (HTMLVideoElement & { audioTracks?: { length: number; [n: number]: { enabled: boolean } } }) | null)?.audioTracks;
+    if (!tracks || tracks.length < 2) return false;
+    for (let n = 0; n < tracks.length; n++) tracks[n].enabled = n === i;
+    return true;
+  };
+
+  /** Hear another audio track of this source. */
+  const chooseAudio = (i: number) => {
+    if (i === audioIdx) return;
+    setAudioIdx(i);
+    if (mode?.kind === 'direct' && supportsAudioTracks && enableNativeTrack(i)) return;
+    const next = choosePlayMode(media.current, canConvert.current, i);
+    const at = (media.current?.durationSec || duration) * JUMPS[jump];
+    if (next.kind === 'direct') {
+      setMode(next);
+      return;
+    }
+    convertAt(at, mode?.kind === 'convert' && mode.video === 'h264' ? { ...next, video: 'h264' } : next);
+  };
+
   const onMeta = () => {
     const v = video.current!;
+    if (mode?.kind !== 'convert') enableNativeTrack(audioIdx);
     if (mode?.kind === 'convert') {
       // Converted streams already start at the chosen spot; re-encoded video may be scaled, so report the file's size.
       const m = media.current;
@@ -268,8 +299,12 @@ export function PreviewModal({
             <>
               <video
                 ref={video}
-                key={mode.kind === 'convert' ? `convert-${mode.video}-${convertStart}` : 'direct'}
-                src={mode.kind === 'convert' ? convertUrl(info, convertStart, mode.video, true) : streamUrl(info, true)}
+                key={mode.kind === 'convert' ? `convert-${mode.video}-${convertStart}-${mode.audio ?? 0}` : 'direct'}
+                src={
+                  mode.kind === 'convert'
+                    ? convertUrl(info, convertStart, mode.video, true, mode.audio ?? 0, convertAudioCodec(audioTracks[mode.audio ?? 0]))
+                    : streamUrl(info, true)
+                }
                 muted={muted}
                 playsInline
                 preload="metadata"
@@ -318,6 +353,17 @@ export function PreviewModal({
             </span>
           )}
         </div>
+
+        {audioTracks.length > 1 && (
+          <FocusGroup focusKey="preview-audio" className="preview-audio chips">
+            <span className="muted small">Audio:</span>
+            {audioTracks.map((a, i) => (
+              <Focusable key={i} className={`chip${audioIdx === i ? ' is-active' : ''}`} disabled={!!playError} onSelect={() => chooseAudio(i)}>
+                {audioLabel(a, i)}
+              </Focusable>
+            ))}
+          </FocusGroup>
+        )}
 
         {verdict ? (
           <VerdictCard v={verdict} />

@@ -57,11 +57,22 @@ export function run(cmd: string, args: string[], timeoutMs: number): Promise<Buf
   });
 }
 
+/** B-frame reorder delay in seconds (MP4 muxing starts copied video this much late). */
+function videoDelay(v?: { has_b_frames?: number; avg_frame_rate?: string; r_frame_rate?: string }): number {
+  if (!v?.has_b_frames) return 0;
+  const rate = (r?: string) => {
+    const [n, d] = (r || '').split('/').map(Number);
+    return n > 0 && d > 0 ? n / d : 0;
+  };
+  const fps = rate(v.avg_frame_rate) || rate(v.r_frame_rate);
+  return fps ? Math.min(0.5, v.has_b_frames / fps) : 0;
+}
+
 export async function probe(url: string): Promise<Verdict['probe']> {
   const out = await run('ffprobe', ['-v', 'error', '-rw_timeout', '60000000', '-print_format', 'json', '-show_format', '-show_streams', url], 120000);
   const j = JSON.parse(out.toString()) as {
     format?: { duration?: string };
-    streams?: { codec_type?: string; codec_name?: string; width?: number; height?: number; channels?: number; field_order?: string; tags?: { language?: string; title?: string } }[];
+    streams?: { codec_type?: string; codec_name?: string; width?: number; height?: number; channels?: number; disposition?: { default?: number }; field_order?: string; has_b_frames?: number; avg_frame_rate?: string; r_frame_rate?: string; tags?: { language?: string; title?: string } }[];
   };
   const streams = j.streams || [];
   const video = streams.find((s) => s.codec_type === 'video');
@@ -70,9 +81,12 @@ export async function probe(url: string): Promise<Verdict['probe']> {
     width: video?.width || 0,
     height: video?.height || 0,
     videoCodec: video?.codec_name || '',
-    audio: streams.filter((s) => s.codec_type === 'audio').map((s) => ({ codec: s.codec_name || '', language: s.tags?.language || 'und', channels: s.channels || 0 })),
+    audio: streams
+      .filter((s) => s.codec_type === 'audio')
+      .map((s) => ({ codec: s.codec_name || '', language: s.tags?.language || 'und', channels: s.channels || 0, title: s.tags?.title || '', default: s.disposition?.default === 1 })),
     subtitles: streams.filter((s) => s.codec_type === 'subtitle').map((s) => s.tags?.language || s.tags?.title || 'und'),
     interlaced: !!video?.field_order && !['progressive', 'unknown'].includes(video.field_order),
+    videoDelaySec: videoDelay(video),
   };
 }
 

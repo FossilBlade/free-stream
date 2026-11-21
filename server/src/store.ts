@@ -90,10 +90,12 @@ export interface Verdict {
     width: number;
     height: number;
     videoCodec: string;
-    audio: { codec: string; language: string; channels: number }[];
+    audio: { codec: string; language: string; channels: number; title?: string; default?: boolean }[];
     subtitles: string[];
     /** Interlaced video (TV broadcast captures); browsers can't decode interlaced H.264 repackaged as MP4. */
     interlaced?: boolean;
+    /** Seconds the video is held back by B-frame reordering when copied into MP4 (frames of delay ÷ frame rate). */
+    videoDelaySec?: number;
   } | null;
   runtimeCheck: 'ok' | 'short' | 'long' | 'unknown';
   fileIssues: string[];
@@ -230,6 +232,25 @@ interface Db {
   ratings: Record<string, { age: number | null; at: number }>;
   /** Per profile id. */
   suggestions: Record<string, SuggestionSet>;
+  /** Recent search results per indexer (for the health check): 1 = answered, 0 = failed/timed out, newest last. */
+  indexerHealth?: Record<string, { recent: number[]; lastError?: string; lastAt: number }>;
+  /** Last health check (shown in Settings; a failure puts a red dot on the Settings icon). */
+  health?: HealthReport;
+}
+
+export interface HealthCheck {
+  id: string;
+  name: string;
+  status: 'ok' | 'warn' | 'fail';
+  detail: string;
+  /** What to do about it (warn/fail only). */
+  fix?: string;
+}
+
+export interface HealthReport {
+  at: number;
+  status: 'ok' | 'warn' | 'fail';
+  checks: HealthCheck[];
 }
 
 export const DATA_DIR = resolve(process.env.DATA_DIR || join(import.meta.dirname, '../../data'));
@@ -330,4 +351,24 @@ export function progressKey(mediaType: MediaType, tmdbId: number, season?: numbe
 
 export function sourceKey(mediaType: MediaType, tmdbId: number, season?: number): string {
   return mediaType === 'tv' && season != null ? `tv:${tmdbId}:s${season}` : `${mediaType}:${tmdbId}`;
+}
+
+/** A source chosen for one episode (single-episode torrents, or "change source" on an episode). */
+export const episodeSourceKey = (tmdbId: number, season: number, episode: number) => `tv:${tmdbId}:s${season}e${episode}`;
+
+/**
+ * The source to use for a movie or an episode: the episode's own choice first, then the season's
+ * (season packs are remembered for the whole season).
+ */
+export function sourceFor(mediaType: MediaType, tmdbId: number, season?: number, episode?: number): SavedSource | undefined {
+  if (mediaType === 'tv' && season != null && episode != null) return db.sources[episodeSourceKey(tmdbId, season, episode)] || db.sources[sourceKey('tv', tmdbId, season)];
+  return db.sources[sourceKey(mediaType, tmdbId, season)];
+}
+
+/** Remembers a chosen source: per episode always, and for the whole season when it's a season pack. */
+export function rememberSource(mediaType: MediaType, tmdbId: number, source: SavedSource, opts: { season?: number; episode?: number; seasonPack?: boolean } = {}): void {
+  if (mediaType === 'tv' && opts.season != null && opts.episode != null) {
+    db.sources[episodeSourceKey(tmdbId, opts.season, opts.episode)] = source;
+    if (opts.seasonPack) db.sources[sourceKey('tv', tmdbId, opts.season)] = source;
+  } else db.sources[sourceKey(mediaType, tmdbId, opts.season)] = source;
 }

@@ -14,6 +14,7 @@ Written in TypeScript: React + Vite on the front end, Express + WebTorrent on th
 - [Setup without Docker](#setup-without-docker)
 - [Watching on an LG TV](#watching-on-an-lg-tv)
 - [Configuration](#configuration)
+- [Health check](#health-check)
 - [Security and privacy](#security-and-privacy)
 - [If something won't play](#if-something-wont-play)
 - [Development](#development)
@@ -172,6 +173,30 @@ Everything can be set on the **Settings** page; values saved there take preceden
 | `TZ` | Time zone for the nightly suggestions, e.g. `Europe/London`. |
 | `OLLAMA_URL`, `OLLAMA_MODEL` | Local AI (defaults `http://localhost:11434`, `gemma4:e2b`). |
 | `AI_MODE`, `AI_REMOTE_PROVIDER`, `AI_REMOTE_API_KEY`, `AI_REMOTE_MODEL` | AI checks: `off`, `local`, `remote` or `local+remote`, and the remote provider. |
+
+## Health check
+
+Settings opens with a **Health check** that tests every part of the setup and says what to fix:
+- App data folder
+- TMDB key
+- Prowlarr or Jackett, plus indexers that keep failing or that Prowlarr has paused
+- ffmpeg
+- Ollama and the AI model, or a remote AI key
+- Disk space and the cache limit
+- Time zone
+- Parent PIN (when there are kids' profiles)
+- Suggestions
+
+It runs every 6 hours in the background. If something fails, a red dot appears on the Settings icon for adults.
+
+From a terminal:
+
+```sh
+npm run doctor                        # when running with npm start
+docker exec freestream npm run doctor # with Docker
+```
+
+Each line prints `OK`, `WARN` or `FAIL`, with a fix under each problem. The command exits with code 1 if anything fails. It only reads; it never changes settings. Remote AI providers are only checked for a key, so it never costs anything.
 
 ## Security and privacy
 

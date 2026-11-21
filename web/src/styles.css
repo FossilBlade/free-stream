@@ -1070,10 +1070,12 @@ html.tv .poster-grid {
   flex-shrink: 0;
 }
 @media (max-width: 760px) {
-  .release-preview span {
+  .release-preview span,
+  .release-download span {
     display: none;
   }
-  .release-preview svg {
+  .release-preview svg,
+  .release-download svg {
     margin-right: 0;
   }
   .release-stats {
@@ -1554,6 +1556,13 @@ html.tv .player video::cue {
 .release-download {
   margin-left: 0.5rem;
   flex-shrink: 0;
+  min-width: 10.5rem;
+  justify-content: center;
+}
+@media (max-width: 760px) {
+  .release-download {
+    min-width: 0;
+  }
 }
 .episode-row {
   display: flex;
@@ -1616,7 +1625,8 @@ html.tv .player video::cue {
 .release-download.is-done {
   color: var(--good);
 }
-.episode-download.is-progress {
+.episode-download.is-progress,
+.release-download.is-progress {
   min-width: 3.1rem;
   padding: 0.7rem 0.6rem;
   font-size: 0.85rem;
@@ -2191,4 +2201,87 @@ html.tv .player video::cue {
 .continue-info.is-focused {
   background: var(--amber);
   color: #1a1204;
+}
+
+/* --- Health check ------------------------------------------------------------------- */
+.nav-dot-bad {
+  background: var(--bad);
+}
+.health {
+  margin-bottom: 2rem;
+  padding: 1rem 1.25rem;
+  border-radius: 0.75rem;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+}
+.health-warn {
+  border-color: rgba(255, 181, 71, 0.45);
+}
+.health-fail {
+  border-color: rgba(248, 113, 113, 0.55);
+}
+.health-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.health-head h2 {
+  margin: 0 1rem 0 0;
+}
+.health-head .actions {
+  margin-left: auto;
+}
+.health-list {
+  list-style: none;
+  margin: 0.75rem 0 0.5rem;
+  padding: 0;
+}
+.health-item {
+  display: flex;
+  align-items: flex-start;
+  margin-bottom: 0.6rem;
+  line-height: 1.4;
+}
+.health-item > svg {
+  flex: 0 0 auto;
+  width: 1.1rem;
+  height: 1.1rem;
+  margin: 0.15rem 0.6rem 0 0;
+}
+.health-item.is-ok > svg {
+  color: var(--good);
+}
+.health-item.is-warn > svg {
+  color: var(--amber);
+}
+.health-item.is-fail > svg {
+  color: var(--bad);
+}
+.health-fix {
+  margin-top: 0.15rem;
+  color: var(--amber);
+  font-size: 0.9rem;
+}
+.test-result {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+.test-result svg {
+  flex: 0 0 auto;
+  margin-top: 0.15rem;
+}
+.preview-audio {
+  align-items: center;
+  margin: 0.25rem 0 0.75rem;
+}
+.preview-audio > .muted {
+  margin-right: 0.5rem;
+}
+.episode-source {
+  margin-left: 0.5rem;
+  flex-shrink: 0;
 }

@@ -1,5 +1,5 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
-import { ChevronDown, ChevronRight, Clapperboard, Eye, RefreshCw, Sparkles, Users } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, Clapperboard, Download, Eye, RefreshCw, Sparkles, Users } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, ApiError, downloadMessage, formatBytes, OUTCOME_TONE, releaseSource, type DownloadRow, type MediaType, type Release, type SavedSource } from '../api';
@@ -126,7 +126,7 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
             {dl && <Badge tone="good">{dl.complete ? '✓ On this Mac' : `Downloading ${Math.floor(dl.progress * 100)}%`}</Badge>}
             {r.info.resolution && <Badge tone="accent">{r.info.resolution === '2160p' ? '4K' : r.info.resolution}</Badge>}
             {r.tier === 'theater' && <Badge tone="ok">{r.info.theater === 'screener' ? 'Screener' : 'Theater recording'}</Badge>}
-            {r.info.multiAudio ? <Badge>Dual audio</Badge> : r.info.languages.slice(0, 2).map((l) => <Badge key={l}>{l}</Badge>)}
+            {r.info.multiAudio ? <Badge title="Several audio languages: FreeStream plays your profile’s language and you can switch with Audio in the player. Preview lists the tracks.">Dual audio</Badge> : r.info.languages.slice(0, 2).map((l) => <Badge key={l}>{l}</Badge>)}
             {r.info.pack && <Badge>Full season</Badge>}
             {playNote(r, canConvert) === 'risky' && <Badge tone="risky">May not play here</Badge>}
             {playNote(r, canConvert) === 'convert' && <Badge>Audio converted here</Badge>}
@@ -152,6 +152,21 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
           <Eye />
           <span>Preview</span>
         </Focusable>
+        {dl?.complete ? (
+          <Focusable className="btn btn-secondary release-download is-done" disabled={busy} title="On this Mac — play it" onSelect={() => onPlay(releaseSource(r))}>
+            <CheckCircle2 />
+            <span>Downloaded</span>
+          </Focusable>
+        ) : dl?.downloading ? (
+          <Focusable className="btn btn-secondary release-download is-progress" title="Downloading — open Downloads" onSelect={() => navigate('/downloads')}>
+            {Math.floor(dl.progress * 100)}%
+          </Focusable>
+        ) : (
+          <Focusable className="btn btn-secondary release-download" disabled={busy} title="Download this source to the Mac" onSelect={() => download(releaseSource(r))}>
+            <Download />
+            <span>Download</span>
+          </Focusable>
+        )}
       </div>
     );
   };

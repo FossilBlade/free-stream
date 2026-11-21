@@ -1,12 +1,19 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
-import { CheckCircle2, PlugZap, Save, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, PlugZap, RefreshCw, Save, XCircle } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
-import { api, type AiMode, type RemoteProvider, type Settings as SettingsData, type SuggestionStatus } from '../api';
+import { api, ApiError, type AiMode, type HealthReport, type RemoteProvider, type Settings as SettingsData, type SuggestionStatus } from '../api';
 import { FocusGroup, Focusable } from '../components/Focusable';
 import { TextField } from '../components/Sources';
 import { Button, Spinner } from '../components/ui';
 import { PinGate } from '../components/PinGate';
 import { detectScreen, screenChoice, screenLabel, setScreenChoice, type ScreenChoice } from '../screen';
+
+/** Why a Test button failed before getting an answer (often the parent PIN unlock expiring after 30 minutes). */
+function failMessage(e: unknown): string {
+  const err = e as ApiError;
+  if (err?.status === 401 && err.code === 'pin') return 'The parent PIN unlock has expired. Reopen Settings and enter the PIN, then test again.';
+  return err?.message || 'The test couldn’t run.';
+}
 
 function Field({ label, hint, children }: { label: string; hint?: ReactNode; children: ReactNode }) {
   return (
@@ -61,6 +68,8 @@ function SettingsInner() {
     try {
       await save();
       setTest(await api.testIndexer());
+    } catch (e) {
+      setTest({ ok: false, message: failMessage(e) });
     } finally {
       setTesting(false);
     }
@@ -75,6 +84,8 @@ function SettingsInner() {
       await save();
       const r = await api.testAi(which);
       setAiTest({ which, ok: r.ok, message: r.message });
+    } catch (e) {
+      setAiTest({ which, ok: false, message: failMessage(e) });
     } finally {
       setAiTesting(null);
     }
@@ -84,16 +95,19 @@ function SettingsInner() {
   const usesRemote = s.aiMode === 'remote' || s.aiMode === 'local+remote';
   const providers = s.aiProviders;
   const provider = providers?.[s.aiRemoteProvider];
+  // On its own line under the button, so long provider messages wrap instead of disappearing.
   const aiResult = (which: string) =>
     aiTest?.which === which && (
-      <span className={aiTest.ok ? 'test-ok' : 'test-fail'}>
-        {aiTest.ok ? <CheckCircle2 /> : <XCircle />} {aiTest.message}
-      </span>
+      <div className={`test-result ${aiTest.ok ? 'test-ok' : 'test-fail'}`}>
+        {aiTest.ok ? <CheckCircle2 /> : <XCircle />}
+        <span>{aiTest.message}</span>
+      </div>
     );
 
   return (
     <div className="page page-padded page-narrow">
       <h1 className="page-title">Settings</h1>
+      <HealthSection />
       <FocusGroup focusKey="settings" className="form">
         <h2>Catalog</h2>
         <Field
@@ -220,7 +234,7 @@ function SettingsInner() {
             </Field>
             <div className="actions">
               <Button icon={<PlugZap />} disabled={!!aiTesting} onSelect={() => runAiTest('remote')}>
-                {aiTesting === 'remote' ? 'Testing…' : 'Test remote model'}
+                {aiTesting === 'remote' ? 'Testing… (up to 45 s)' : 'Test remote model'}
               </Button>
               {aiResult('remote')}
             </div>
@@ -371,5 +385,61 @@ function SuggestionsStatus() {
         </Button>
       </div>
     </div>
+  );
+}
+
+const HEALTH_ICON = { ok: CheckCircle2, warn: AlertTriangle, fail: XCircle } as const;
+
+/** Health check: every part of the setup, with what to fix. Also runs in the background every 6 hours. */
+function HealthSection() {
+  const [report, setReport] = useState<HealthReport | null>(null);
+  const [running, setRunning] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  useEffect(() => {
+    api
+      .health()
+      .then(setReport)
+      .catch(() => {});
+  }, []);
+  const run = async () => {
+    setRunning(true);
+    try {
+      setReport(await api.runHealthCheck());
+    } finally {
+      setRunning(false);
+    }
+  };
+  const problems = report?.checks.filter((c) => c.status !== 'ok') || [];
+  const shown = report ? (showAll || !problems.length ? report.checks : problems) : [];
+  return (
+    <section className={`health health-${report?.status || 'ok'}`}>
+      <div className="health-head">
+        <h2>Health check</h2>
+        <span className="muted small">
+          {running ? 'Checking…' : report ? `${report.status === 'ok' ? 'Everything looks good' : report.status === 'warn' ? `${problems.length} warning${problems.length === 1 ? '' : 's'}` : 'Something needs fixing'} · checked ${ago(report.at)}` : 'Not checked yet'}
+        </span>
+        <FocusGroup focusKey="health-actions" className="actions actions-tight">
+          <Button icon={<RefreshCw />} disabled={running} onSelect={run}>
+            {running ? 'Checking…' : 'Check now'}
+          </Button>
+          {problems.length > 0 && <Button onSelect={() => setShowAll((v) => !v)}>{showAll ? 'Only problems' : 'Show all'}</Button>}
+        </FocusGroup>
+      </div>
+      <ul className="health-list">
+        {shown.map((c) => {
+          const Icon = HEALTH_ICON[c.status];
+          return (
+            <li key={c.id} className={`health-item is-${c.status}`}>
+              <Icon />
+              <div>
+                <strong>{c.name}</strong> <span className="muted">{c.detail}</span>
+                {c.fix && c.status !== 'ok' && <div className="health-fix">→ {c.fix}</div>}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="muted small">Runs every 6 hours; a failure puts a red dot on the Settings icon. From a terminal: <code>npm run doctor</code> (Docker: <code>docker exec freestream npm run doctor</code>).</p>
+    </section>
   );
 }
