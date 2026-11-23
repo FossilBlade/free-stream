@@ -172,10 +172,10 @@ export function ContinueCard({ p }: { p: Progress }) {
             <Play />
           </div>
           <div className="card-title">{p.title}</div>
-          <ProgressBar value={p.position / (p.duration || 1)} />
+          {!p.upNext && <ProgressBar value={p.position / (p.duration || 1)} />}
         </div>
         <div className="card-meta">
-          {ep && <span className="accent">{ep}</span>}
+          {ep && <span className="accent">{p.upNext ? `Next: ${ep}` : ep}</span>}
           <span>
             {ep && p.episodeTitle ? p.episodeTitle : `${left} min left`}
           </span>

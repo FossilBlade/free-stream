@@ -521,6 +521,13 @@ export function rememberFile(t: Torrent, fileIdx: number, ep?: { season?: number
   if (upsertItem(t, fileIdx, ep)) save();
 }
 
+/** True when an episode is on the Mac or on its way (from any source); partly watched files don't count. */
+export function hasEpisodeDownload(tmdbId: number, season: number, episode: number): boolean {
+  return Object.values(db.downloads).some(
+    (d) => d.mediaType === 'tv' && d.tmdbId === tmdbId && Object.values(d.items || {}).some((it) => it.season === season && it.episode === episode && (it.progress >= 1 || it.downloading)),
+  );
+}
+
 export type DownloadStart = 'started' | 'already-downloading' | 'already-complete';
 
 /** Download button: fetch the whole file without playing it, keep going until done, never auto-delete. */

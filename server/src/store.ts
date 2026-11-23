@@ -94,8 +94,6 @@ export interface Verdict {
     subtitles: string[];
     /** Interlaced video (TV broadcast captures); browsers can't decode interlaced H.264 repackaged as MP4. */
     interlaced?: boolean;
-    /** Seconds the video is held back by B-frame reordering when copied into MP4 (frames of delay ÷ frame rate). */
-    videoDelaySec?: number;
   } | null;
   runtimeCheck: 'ok' | 'short' | 'long' | 'unknown';
   fileIssues: string[];
@@ -125,8 +123,15 @@ export interface Watch {
   backdropPath: string | null;
   season?: number;
   episode?: number;
-  /** release = waiting for it to come out; upgrade = have a theater/low copy, want a proper one. */
-  reason: 'release' | 'upgrade';
+  /**
+   * release = waiting for it to come out (or for a source to download); upgrade = have a theater/low
+   * copy, want a proper one; follow = a season still airing: download each new episode as it airs.
+   */
+  reason: 'release' | 'upgrade' | 'follow';
+  /** Download what's found even when auto-download is off in Settings (episodes asked for in a batch). */
+  download?: boolean;
+  /** follow: the next episode number to hand off once it airs. */
+  fromEpisode?: number;
   /** For upgrades: the copy we already have (excluded from results). */
   currentInfoHash?: string;
   createdAt: number;

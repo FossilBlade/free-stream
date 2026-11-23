@@ -50,17 +50,35 @@ export function Home() {
   const [error, setError] = useState<ApiError | null>(null);
 
   useEffect(() => {
-    api
-      .home()
-      .then((d) =>
-        setData({
-          continueWatching: d.continueWatching,
-          myList: d.myList.map((m) => ({ mediaType: m.mediaType, id: m.tmdbId, title: m.title, overview: '', posterPath: m.posterPath, backdropPath: m.backdropPath, year: '', releaseDate: '', language: '', rating: 0 })),
-          suggestions: d.suggestions || [],
-          rows: d.rows,
-        }),
-      )
-      .catch(setError);
+    let alive = true;
+    let loaded = false;
+    const load = () =>
+      api
+        .home()
+        .then((d) => {
+          if (!alive) return;
+          const fresh = {
+            continueWatching: d.continueWatching,
+            myList: d.myList.map((m) => ({ mediaType: m.mediaType, id: m.tmdbId, title: m.title, overview: '', posterPath: m.posterPath, backdropPath: m.backdropPath, year: '', releaseDate: '', language: '', rating: 0 })),
+            suggestions: d.suggestions || [],
+            rows: d.rows,
+          };
+          // Back in the app: take what may have changed on another device, keep the rows and banner as they are.
+          setData((prev) => {
+            if (!prev) return fresh;
+            const same = JSON.stringify([prev.continueWatching, prev.myList]) === JSON.stringify([fresh.continueWatching, fresh.myList]);
+            return same ? prev : { ...prev, continueWatching: fresh.continueWatching, myList: fresh.myList };
+          });
+          loaded = true;
+        })
+        .catch((e) => alive && !loaded && setError(e));
+    load();
+    const onVisible = () => document.visibilityState === 'visible' && load();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      alive = false;
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   const hero = useMemo(() => (data ? pickHero(data.rows) : null), [data]);

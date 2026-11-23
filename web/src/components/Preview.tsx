@@ -70,12 +70,11 @@ export function PreviewModal({
   const [audioTracks, setAudioTracks] = useState<MediaInfo['audio']>([]);
   const [audioIdx, setAudioIdx] = useState(0);
 
-  /** Converted previews restart at each spot; copied video starts on the keyframe at or before it. */
-  const convertAt = async (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
+  /** Converted previews restart at each spot (from the keyframe just before it). */
+  const convertAt = (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
     if (!info) return;
-    const start = m.video === 'copy' && t > 0 ? await api.convertStart(info.infoHash, info.fileIdx, t, true).catch(() => t) : t;
     setBuffering(true);
-    setConvertStart(start);
+    setConvertStart(t);
     setMode(m);
   };
 

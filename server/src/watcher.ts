@@ -1,14 +1,16 @@
 /**
  * Watches titles in the background:
  *  - "release": not out yet (or only in theaters) -> find a proper release once it's out.
+ *    Episodes from a batch download that had no source use this too, with `download` set.
  *  - "upgrade": you're on a theater/low copy -> find a proper one.
+ *  - "follow": a season still airing -> hand each new episode to a download "release" watch as it airs.
  * Candidates go through the deep check; only "verified" ones count as found.
  */
 import { searchReleases, type Release } from './indexers.ts';
 import { parseRelease } from './release.ts';
 import { db, episodeSourceKey, getSettings, rememberSource, save, sourceFor, type MediaType, type SavedSource, type Watch } from './store.ts';
 import * as tmdb from './tmdb.ts';
-import { addSource, pickFile, startDownload } from './torrents.ts';
+import { addSource, hasEpisodeDownload, pickFile, startDownload } from './torrents.ts';
 import { deepCheck, verdictForHash } from './verify.ts';
 
 const HOUR = 3600 * 1000;
@@ -20,14 +22,25 @@ const PLAY_RANK = { good: 0, ok: 1, risky: 2 } as const;
 export const watchKey = (mediaType: MediaType, tmdbId: number, season?: number, episode?: number) =>
   mediaType === 'tv' && season != null && episode != null ? `tv:${tmdbId}:s${season}e${episode}` : `${mediaType}:${tmdbId}`;
 
+/** A season being followed for new episodes (one per season, separate from its episodes' watches). */
+export const followKey = (tmdbId: number, season: number) => `tv:${tmdbId}:s${season}:new`;
+
 export function getWatch(mediaType: MediaType, tmdbId: number, season?: number, episode?: number): Watch | undefined {
   return db.watches[watchKey(mediaType, tmdbId, season, episode)];
 }
 
-export async function addWatch(p: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; reason: Watch['reason']; currentInfoHash?: string }): Promise<Watch> {
-  const key = watchKey(p.mediaType, p.tmdbId, p.season, p.episode);
+export async function addWatch(p: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; reason: Watch['reason']; currentInfoHash?: string; download?: boolean; fromEpisode?: number }): Promise<Watch> {
+  const key = p.reason === 'follow' ? followKey(p.tmdbId, p.season!) : watchKey(p.mediaType, p.tmdbId, p.season, p.episode);
   const existing = db.watches[key];
-  if (existing && existing.status !== 'gave-up' && existing.reason === p.reason) return existing;
+  if (existing && existing.status !== 'gave-up' && existing.reason === p.reason) {
+    // Asked to download something already being watched for: download it (now, if it was already found).
+    if (p.download && !existing.download) {
+      existing.download = true;
+      if (existing.status === 'found' && existing.found && !existing.downloaded) await downloadFound(existing).catch((e) => console.error(`[watch] ${existing.title}:`, (e as Error).message));
+      save();
+    }
+    return existing;
+  }
   const d = await tmdb.details(p.mediaType, p.tmdbId);
   const w: Watch = {
     key,
@@ -41,16 +54,29 @@ export async function addWatch(p: { mediaType: MediaType; tmdbId: number; season
     episode: p.episode,
     reason: p.reason,
     currentInfoHash: p.currentInfoHash,
+    download: p.download || undefined,
+    fromEpisode: p.fromEpisode,
     createdAt: Date.now(),
     nextCheck: Date.now(), // check soon
     checks: 0,
     status: 'waiting',
-    note: p.reason === 'upgrade' ? 'Looking for a better version…' : 'Waiting for release…',
+    note: p.reason === 'upgrade' ? 'Looking for a better version…' : p.reason === 'follow' ? 'Downloads new episodes as they air' : p.download ? 'Finding a source to download…' : 'Waiting for release…',
   };
   db.watches[key] = w;
   save();
   setTimeout(tick, 2000); // don't wait for the next interval
   return w;
+}
+
+/** Starts downloading what a watch found, and remembers it as the source. */
+async function downloadFound(w: Watch): Promise<void> {
+  const d = await tmdb.details(w.mediaType, w.tmdbId);
+  const source = w.found!.source;
+  const t = await addSource(source, { mediaType: w.mediaType, tmdbId: w.tmdbId, title: d.year ? `${d.title} (${d.year})` : d.title });
+  startDownload(t, pickFile(t, w.season, w.episode), { season: w.season, episode: w.episode });
+  rememberSource(w.mediaType, w.tmdbId, source, { season: w.season, episode: w.episode, seasonPack: parseRelease(source.releaseTitle).pack });
+  w.downloaded = true;
+  w.note = `Found and downloading: ${w.found!.label}`;
 }
 
 export function removeWatch(key: string): void {
@@ -89,9 +115,52 @@ function schedule(w: Watch, ms: number, note: string): void {
   w.note = note;
 }
 
+/**
+ * Following a season: each episode that has aired since gets its own download watch (which finds,
+ * checks and downloads a source, retrying until one turns up). Ends once the season is over.
+ */
+async function followSeason(w: Watch): Promise<void> {
+  const season = w.season!;
+  const [d, eps] = await Promise.all([tmdb.details('tv', w.tmdbId), tmdb.season(w.tmdbId, season)]);
+  const today = tmdb.today();
+  const list = [...eps].sort((a, b) => a.number - b.number);
+  for (const e of list) {
+    if (e.number < (w.fromEpisode ?? 1)) continue;
+    if (!e.airDate || e.airDate > today) break;
+    if (!hasEpisodeDownload(w.tmdbId, season, e.number)) {
+      await addWatch({ mediaType: 'tv', tmdbId: w.tmdbId, season, episode: e.number, reason: 'release', download: true });
+      console.log(`[watch] ${w.title}: S${season}E${e.number} is out — finding a source`);
+    }
+    w.fromEpisode = e.number + 1;
+  }
+
+  const next = list.find((e) => e.number >= (w.fromEpisode ?? 1));
+  if (next) {
+    const until = next.airDate ? Math.min(Math.max(Date.parse(next.airDate) - Date.now(), 6 * HOUR), 2 * DAY) : 2 * DAY;
+    schedule(w, until, next.airDate ? `Next: episode ${next.number} airs ${fmtDate(next.airDate)}` : `Next: episode ${next.number} (air date not announced)`);
+    return;
+  }
+  // Every listed episode is out. Over when the next episode is in a later season, or a month has
+  // passed with nothing new (a break mid-season shows up as listed episodes without dates).
+  const lastAired = list.at(-1)?.airDate;
+  const over = (d.release.nextEpisode && d.release.nextEpisode.season > season) || !lastAired || Date.parse(lastAired) + 30 * DAY < Date.now();
+  if (over) {
+    console.log(`[watch] ${w.title}: season ${season} is over — stopped following`);
+    delete db.watches[w.key];
+    return;
+  }
+  schedule(w, 2 * DAY, 'All listed episodes are out — checking for more');
+}
+
 async function process(w: Watch): Promise<void> {
   w.lastChecked = Date.now();
   w.checks++;
+  if (w.reason === 'follow') return followSeason(w);
+  // Asked to download an episode that's since been downloaded some other way: nothing left to do.
+  if (w.download && w.season != null && w.episode != null && hasEpisodeDownload(w.tmdbId, w.season, w.episode)) {
+    delete db.watches[w.key];
+    return;
+  }
   const d = await tmdb.details(w.mediaType, w.tmdbId);
 
   // Not out yet: sleep until the expected date (re-checking at least every 2 days in case dates change).
@@ -125,13 +194,7 @@ async function process(w: Watch): Promise<void> {
       w.found = { source: { ...source, infoHash: v.infoHash }, label: v.label, outcome: v.outcome, resolution: r.info.resolution, size: r.size, foundAt: Date.now() };
       w.note = `Found: ${v.label}`;
       console.log(`[watch] ${w.title}: found ${r.title}`);
-      if (getSettings().watchAutoDownload) {
-        const t = await addSource(w.found.source, { mediaType: w.mediaType, tmdbId: w.tmdbId, title: d.year ? `${d.title} (${d.year})` : d.title });
-        startDownload(t, pickFile(t, w.season, w.episode), { season: w.season, episode: w.episode });
-        rememberSource(w.mediaType, w.tmdbId, w.found.source, { season: w.season, episode: w.episode, seasonPack: parseRelease(w.found.source.releaseTitle).pack });
-        w.downloaded = true;
-        w.note = `Found and downloading: ${v.label}`;
-      }
+      if (w.download || getSettings().watchAutoDownload) await downloadFound(w);
       return;
     } catch (e) {
       console.error(`[watch] ${w.title}: couldn't check ${r.title}:`, (e as Error).message);
@@ -152,15 +215,20 @@ async function tick(): Promise<void> {
   if (running) return;
   running = true;
   try {
-    const due = Object.values(db.watches).filter((w) => w.status === 'waiting' && w.nextCheck <= Date.now());
-    for (const w of due) {
-      try {
-        await process(w);
-      } catch (e) {
-        console.error(`[watch] ${w.title}:`, (e as Error).message);
-        schedule(w, 6 * HOUR, 'Check failed — will retry');
+    // A few rounds, so watches added meanwhile (a batch download, a followed season's new episode) start now.
+    for (let round = 0; round < 5; round++) {
+      const due = Object.values(db.watches).filter((w) => w.status === 'waiting' && w.nextCheck <= Date.now());
+      if (!due.length) break;
+      for (const w of due) {
+        if (db.watches[w.key] !== w) continue; // removed meanwhile
+        try {
+          await process(w);
+        } catch (e) {
+          console.error(`[watch] ${w.title}:`, (e as Error).message);
+          schedule(w, 6 * HOUR, 'Check failed — will retry');
+        }
+        save();
       }
-      save();
     }
   } finally {
     running = false;

@@ -1,11 +1,12 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
-import { Bell, BellRing, CalendarClock, Check, CheckCircle2, Clapperboard, Download, Link2, ListPlus, ListVideo, Play, Sparkles, Star, ThumbsDown } from 'lucide-react';
+import { Bell, BellRing, CalendarClock, Check, CheckCircle2, CheckSquare, Clapperboard, Download, Link2, ListChecks, ListPlus, ListVideo, Play, Search, Sparkles, Square, Star, ThumbsDown, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, downloadMessage, formatRuntime, img, shortDate, todayIso, type Card, type Details, type DownloadRow, type Episode, type MediaType, type Progress, type SavedSource, type Verdict, type Watch } from '../api';
+import { api, ApiError, batchMessage, downloadMessage, formatRuntime, img, shortDate, todayIso, type Card, type Details, type DownloadRow, type Episode, type MediaType, type Progress, type SavedSource, type Verdict, type Watch } from '../api';
 import { FocusGroup, Focusable } from '../components/Focusable';
 import { MagnetModal } from '../components/MagnetModal';
 import { Row, TitleCard } from '../components/Row';
+import { SeasonDownload, type SeasonBatch } from '../components/SeasonDownload';
 import { Sources, type PickMode } from '../components/Sources';
 import { toast } from '../components/Toast';
 import { VerdictCard } from '../components/VerdictCard';
@@ -17,6 +18,13 @@ interface Target {
   season?: number;
   episode?: number;
 }
+
+/** Watched far enough to count as seen (matches the server). */
+const FINISHED = 0.92;
+/** Out already (episodes without a date are announced but not scheduled yet). */
+const isOut = (e: Episode) => !!e.airDate && e.airDate <= todayIso();
+/** Out, and not on the Mac, downloading, or being found already. */
+const needsDownload = (e: Episode) => isOut(e) && !e.download?.complete && !e.download?.downloading && !e.finding;
 
 export function Title() {
   const { type: typeParam, id: idParam } = useParams();
@@ -35,6 +43,12 @@ export function Title() {
   const [episodes, setEpisodes] = useState<Episode[] | null>(null);
   /** Downloads of this title (movie) or of the selected season (show). */
   const [downloads, setDownloads] = useState<DownloadRow[]>([]);
+  /** The selected season's "download new episodes as they air" watch. */
+  const [follow, setFollow] = useState<Watch | null>(null);
+  /** Episode numbers ticked in Select mode (null when not selecting). */
+  const [selecting, setSelecting] = useState<number[] | null>(null);
+  /** Several episodes about to download: choosing a season pack for them. */
+  const [batch, setBatch] = useState<SeasonBatch | null>(null);
 
   const [watch, setWatch] = useState<Watch | null>(null);
   const [upgrade, setUpgrade] = useState<Watch | null>(null);
@@ -97,6 +111,7 @@ export function Title() {
         .then((r) => {
           setEpisodes(r.episodes);
           setDownloads(r.downloads);
+          setFollow(r.follow);
         })
         .catch(() => !quiet && setEpisodes([]));
     },
@@ -104,6 +119,8 @@ export function Title() {
   );
 
   useEffect(() => {
+    setSelecting(null);
+    setBatch(null);
     if (type === 'tv' && season != null) loadSeason(season);
   }, [type, season, loadSeason]);
 
@@ -120,11 +137,13 @@ export function Title() {
   }, [type, id, season, loadSeason]);
 
   const anyDownloading = downloads.some((d) => d.downloading);
+  // Episodes still waiting for a source change less often than download progress.
+  const anyFinding = type === 'tv' && !!episodes?.some((e) => e.finding);
   useEffect(() => {
-    if (!anyDownloading) return;
-    const t = setInterval(refreshDownloads, 4000);
+    if (!anyDownloading && !anyFinding) return;
+    const t = setInterval(refreshDownloads, anyDownloading ? 4000 : 15000);
     return () => clearInterval(t);
-  }, [anyDownloading, refreshDownloads]);
+  }, [anyDownloading, anyFinding, refreshDownloads]);
 
   // Movie downloads: a finished copy (the explicitly downloaded one first), or one in progress.
   const completeDl = type === 'movie' ? downloads.filter((d) => d.complete && d.fileIdx != null).sort((a, b) => Number(b.requested) - Number(a.requested))[0] : undefined;
@@ -150,6 +169,7 @@ export function Title() {
   }, [type, details, lastWatched]);
 
   const openPicker = useCallback((t: Target, mode: PickMode, theater = false) => {
+    setBatch(null);
     setPicking({ ...t, mode, theater });
     if (t.season != null) setSeason(t.season);
     // Sources focuses its own list once the search finishes.
@@ -234,6 +254,39 @@ export function Title() {
     }
   };
 
+  /** Several episodes of the shown season: pick a season pack for them (or let FreeStream find each). */
+  const openBatch = (eps: number[], label: string, airing: boolean) => {
+    if (season == null) return;
+    setSelecting(null);
+    setPicking(null);
+    setBatch({ season, episodes: eps, label, airing });
+    setTimeout(() => sourcesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+  };
+
+  /** Everything out is on the Mac already: just download new episodes as they air. */
+  const followSeason = async () => {
+    if (season == null) return;
+    try {
+      toast(batchMessage(await api.downloadEpisodes({ tmdbId: id, season, episodes: [], follow: true })));
+      loadSeason(season, true);
+    } catch (e) {
+      toast((e as ApiError).message, 'error');
+    }
+  };
+
+  const stopFollowing = async () => {
+    if (!follow) return;
+    try {
+      await api.unwatch(follow.key);
+      setFollow(null);
+      toast(`New episodes of season ${follow.season} won’t download automatically any more.`);
+    } catch (e) {
+      toast((e as ApiError).message, 'error');
+    }
+  };
+
+  const toggleSelected = (n: number) => setSelecting((sel) => (sel ? (sel.includes(n) ? sel.filter((x) => x !== n) : [...sel, n].sort((a, b) => a - b)) : sel));
+
   /** Notify me: watch for a proper release in the background. */
   const toggleWatch = async () => {
     try {
@@ -299,6 +352,17 @@ export function Title() {
   const hasCopy = !!(currentSource || completeDl);
   const pickingEpisode = picking?.episode != null ? episodes?.find((e) => e.number === picking.episode) : undefined;
   const pickerSubtitle = picking && type === 'tv' ? `Season ${picking.season} · Episode ${picking.episode}${pickingEpisode ? ` · ${pickingEpisode.name}` : ''}` : undefined;
+
+  // Downloading several episodes of the shown season.
+  const seasonTodo = (episodes || []).filter(needsDownload).map((e) => e.number);
+  const anyOut = !!episodes?.some(isOut);
+  const airing = !!episodes?.some((e) => !isOut(e)) || release.nextEpisode?.season === season;
+  // "Rest of season": from the episode you're up to (the next one if you finished it).
+  const upTo = lastWatched?.season === season && lastWatched?.episode != null ? lastWatched.episode : null;
+  const restFrom = upTo != null && (episodes?.find((e) => e.number === upTo)?.progress ?? 0) >= FINISHED ? upTo + 1 : upTo;
+  const restTodo = restFrom != null ? seasonTodo.filter((n) => n >= restFrom) : [];
+  const showRest = restTodo.length > 0 && restTodo.length < seasonTodo.length;
+  const selectable = new Set(seasonTodo);
 
   return (
     <div className="page page-detail">
@@ -458,13 +522,67 @@ export function Title() {
               </Focusable>
             ))}
           </FocusGroup>
+          {!isKid && episodes && (anyOut || airing) && (
+            <FocusGroup focusKey="season-actions" className="actions actions-tight season-actions">
+              {selecting ? (
+                <>
+                  <Button variant="primary" icon={<Download />} disabled={!selecting.length} onSelect={() => openBatch(selecting, 'Picked episodes', airing)}>
+                    {selecting.length ? `Download ${selecting.length} episode${selecting.length === 1 ? '' : 's'}` : 'Pick episodes below'}
+                  </Button>
+                  <Button icon={<ListChecks />} onSelect={() => setSelecting(selecting.length === seasonTodo.length ? [] : seasonTodo)}>
+                    {selecting.length === seasonTodo.length ? 'Clear' : 'Select all'}
+                  </Button>
+                  <Button variant="ghost" icon={<X />} onSelect={() => setSelecting(null)}>
+                    Cancel
+                  </Button>
+                </>
+              ) : (
+                <>
+                  {seasonTodo.length > 0 ? (
+                    <Button icon={<Download />} onSelect={() => openBatch(seasonTodo, 'Whole season', airing)}>
+                      Download season
+                    </Button>
+                  ) : airing && !follow ? (
+                    <Button icon={<Download />} onSelect={followSeason}>
+                      Download new episodes as they air
+                    </Button>
+                  ) : !airing ? (
+                    <Button icon={<CheckCircle2 />} className="btn-done" onSelect={() => navigate('/downloads')}>
+                      Season downloaded
+                    </Button>
+                  ) : null}
+                  {showRest && (
+                    <Button icon={<Download />} onSelect={() => openBatch(restTodo, `From episode ${restFrom}`, airing)}>
+                      Rest of season
+                    </Button>
+                  )}
+                  {seasonTodo.length > 1 && (
+                    <Button icon={<ListChecks />} onSelect={() => setSelecting([])}>
+                      Select episodes
+                    </Button>
+                  )}
+                  {follow && (
+                    <Button icon={<BellRing />} className="btn-done" onSelect={stopFollowing}>
+                      New episodes download automatically
+                    </Button>
+                  )}
+                </>
+              )}
+            </FocusGroup>
+          )}
           {!episodes ? (
             <Spinner />
           ) : (
             <FocusGroup focusKey="episodes" className="episode-list">
               {episodes.map((e) => (
-                <div className="episode-row" key={e.number}>
-                  <Focusable className="episode" disabled={busy} onSelect={() => playEpisode(season!, e.number)}>
+                <div className={`episode-row${selecting ? ' is-picking' : ''}${selecting && !selectable.has(e.number) ? ' is-unselectable' : ''}${selecting?.includes(e.number) ? ' is-selected' : ''}`} key={e.number}>
+                  <Focusable
+                    className="episode"
+                    disabled={busy}
+                    title={selecting && !selectable.has(e.number) ? (isOut(e) ? 'Already downloaded or on its way' : 'Not out yet') : undefined}
+                    onSelect={() => (selecting ? selectable.has(e.number) && toggleSelected(e.number) : playEpisode(season!, e.number))}
+                  >
+                    {selecting && <div className="episode-check">{selecting.includes(e.number) ? <CheckSquare /> : <Square />}</div>}
                     <div className="episode-num">{e.number}</div>
                     <div className="episode-still">
                       {e.stillPath ? <img src={img(e.stillPath, 'w300')} alt="" loading="lazy" onError={hideBroken} /> : <div className="card-fallback" />}
@@ -499,6 +617,10 @@ export function Title() {
                     <Focusable className="btn btn-secondary episode-download is-progress" title="Downloading" onSelect={() => navigate('/downloads')}>
                       {Math.floor(e.download.progress * 100)}%
                     </Focusable>
+                  ) : e.finding ? (
+                    <Focusable className="btn btn-secondary btn-icon episode-download is-finding" title={e.finding} onSelect={() => navigate('/watching')}>
+                      <Search />
+                    </Focusable>
                   ) : null}
                 </div>
               ))}
@@ -508,6 +630,27 @@ export function Title() {
       )}
 
       <div ref={sourcesRef}>
+        {batch && !picking && !isKid && (
+          <SeasonDownload
+            key={`${batch.season}-${batch.episodes.join(',')}`}
+            tmdbId={id}
+            title={details.title}
+            year={details.year}
+            batch={batch}
+            downloads={downloads}
+            busy={busy}
+            onPlay={(ep, src) => play({ season: batch.season, episode: ep }, src)}
+            onStarted={() => {
+              setBatch(null);
+              loadSeason(batch.season, true);
+              setTimeout(() => setFocus('season-actions'), 50);
+            }}
+            onCancel={() => {
+              setBatch(null);
+              setTimeout(() => setFocus('season-actions'), 50);
+            }}
+          />
+        )}
         {picking && !isKid && (
           <Sources
             key={`${picking.mode}-${picking.season}-${picking.episode}`}

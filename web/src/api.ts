@@ -68,6 +68,8 @@ export interface Episode {
   airDate: string | null;
   progress: number;
   download: EpisodeDownload | null;
+  /** Asked to download but no source yet: what FreeStream is doing about it (e.g. "Finding a source to download…"). */
+  finding: string | null;
   /** The source this episode plays from: its own choice (own) or the season pack. */
   source: { releaseTitle: string; infoHash: string | null; own: boolean } | null;
 }
@@ -89,6 +91,8 @@ export interface Progress extends MediaRef {
   infoHash: string;
   fileIdx: number;
   updatedAt: number;
+  /** Continue Watching: the episode after one just finished, not started yet. */
+  upNext?: boolean;
 }
 
 export interface SavedSource {
@@ -160,7 +164,10 @@ export interface Watch {
   backdropPath: string | null;
   season?: number;
   episode?: number;
-  reason: 'release' | 'upgrade';
+  /** follow = a season still airing, whose new episodes download as they air. */
+  reason: 'release' | 'upgrade' | 'follow';
+  /** Downloads what it finds (an episode from a batch download, or a followed season). */
+  download?: boolean;
   createdAt: number;
   lastChecked?: number;
   nextCheck: number;
@@ -390,7 +397,7 @@ export const api = {
       /** Why this title is in the profile's suggestions, if it is. */
       suggestedBecause: string | null;
     }>(`/title/${type}/${id}`),
-  season: (id: number, n: number) => get<{ episodes: Episode[]; savedSource: SavedSource | null; downloads: DownloadRow[] }>(`/title/tv/${id}/season/${n}`),
+  season: (id: number, n: number) => get<{ episodes: Episode[]; savedSource: SavedSource | null; downloads: DownloadRow[]; follow: Watch | null }>(`/title/tv/${id}/season/${n}`),
   sources: (p: { type: MediaType; id?: number; title: string; year?: string; season?: number; episode?: number; screen?: number; dolby?: 0 | 1 }) =>
     get<{ releases: Release[]; skipped: string[]; canConvert?: boolean }>(`/sources?${qs(p)}`),
   prewarm: (b: { mediaType: MediaType; tmdbId: number; season?: number }) => request<{ ok: boolean }>('POST', '/prewarm', b),
@@ -400,9 +407,6 @@ export const api = {
   preview: (b: { source: SavedSource; season?: number; episode?: number; mediaType?: MediaType; tmdbId?: number }) => request<PlayInfo & { fileSize: number }>('POST', '/preview', b),
   discardPreview: (hash: string) => request<{ discarded: boolean }>('DELETE', `/preview/${hash}`),
   media: (hash: string, file: number, preview = false) => get<{ canConvert: boolean; info: MediaInfo | null; error?: string }>(`/media/${hash}/${file}${preview ? '?preview' : ''}`),
-  /** Where a copied-video conversion near `at` really starts: the keyframe at or before it (keeps sound in sync). */
-  convertStart: (hash: string, file: number, at: number, preview = false) =>
-    get<{ start: number }>(`/convert/${hash}/${file}/start?at=${at.toFixed(2)}${preview ? '&preview' : ''}`).then((r) => r.start),
   torrentStatus: (hash: string, file?: number) => get<TorrentStatus>(`/torrents/${hash}/status?${qs({ file })}`),
   saveProgress: (p: Omit<Progress, 'updatedAt'>) => request('POST', '/progress', p),
   clearProgress: (type: MediaType, id: number) => request('DELETE', `/progress/${type}/${id}`),
@@ -412,6 +416,8 @@ export const api = {
   deleteDownload: (hash: string, fileIdx?: number | null) => request('DELETE', `/downloads/${hash}?${qs({ file: fileIdx ?? undefined })}`),
   download: (b: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource }) =>
     request<{ status: 'started' | 'already-downloading' | 'already-complete'; infoHash: string; fileIdx: number; fileName: string }>('POST', '/download', b),
+  /** Several episodes of a season: from the season pack given, else remembered sources, else found in the background. */
+  downloadEpisodes: (b: { tmdbId: number; season: number; episodes: number[]; source?: SavedSource; follow?: boolean }) => request<BatchDownload>('POST', '/download/episodes', b),
   keep: (hash: string, kept: boolean) => request('POST', `/downloads/${hash}/keep`, { kept }),
   settings: () => get<Settings>('/settings'),
   saveSettings: (s: Partial<Settings>) => request<Settings>('PUT', '/settings', s),
@@ -438,6 +444,32 @@ export function downloadMessage(r: { status: string; fileName: string }): string
   if (r.status === 'already-complete') return `${r.fileName} is already downloaded.`;
   if (r.status === 'already-downloading') return `${r.fileName} is already downloading.`;
   return `Downloading ${r.fileName} — progress is on the Downloads page.`;
+}
+
+export interface BatchDownload {
+  started: number[];
+  already: number[];
+  /** No source yet: being found in the background (shown under Watching). */
+  searching: number[];
+  following: boolean;
+  size: number;
+}
+
+/** "E3, E4 and E7" (or "8 episodes" for long lists). */
+function episodeList(eps: number[]): string {
+  if (eps.length > 4) return `${eps.length} episodes`;
+  const names = eps.map((e) => `E${e}`);
+  return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names.at(-1)}` : names[0];
+}
+
+export function batchMessage(r: BatchDownload): string {
+  const parts: string[] = [];
+  if (r.started.length) parts.push(`Downloading ${r.started.length} episode${r.started.length === 1 ? '' : 's'} (${formatBytes(r.size)})`);
+  if (r.searching.length) parts.push(`finding sources for ${episodeList(r.searching)} in the background (see Watching)`);
+  if (r.following) parts.push('new episodes will download as they air');
+  if (!parts.length) return r.already.length ? 'Those episodes are already downloaded.' : 'Nothing to download.';
+  const text = parts.join('; ');
+  return `${text[0].toUpperCase()}${text.slice(1)}.`;
 }
 
 /** "S1:E3" for episodes, "" for movies. */

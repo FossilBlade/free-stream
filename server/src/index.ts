@@ -9,7 +9,8 @@ import { markNotInterested, moreLikeThis, rebuild, startSuggestions, suggestedBe
 import { remoteDefaults, testJudge } from './llm.ts';
 import { guessTitle, parseRelease } from './release.ts';
 import { deepCheck, getVerdict, hasFfmpeg, setSelfBaseUrl, verdictForHash } from './verify.ts';
-import { addWatch, autoSource, markSeen, removeWatch, startWatcher } from './watcher.ts';
+import { addWatch, autoSource, followKey, markSeen, removeWatch, startWatcher, watchKey } from './watcher.ts';
+import type { Torrent } from 'webtorrent';
 import {
   adultsOnly,
   ageOf,
@@ -49,7 +50,7 @@ import {
   type Settings,
 } from './store.ts';
 import { shiftVtt, srtToVtt } from './subtitles.ts';
-import { keyframeAt, mediaInfo, setTranscodeBaseUrl, transcode } from './transcode.ts';
+import { mediaInfo, setTranscodeBaseUrl, transcode } from './transcode.ts';
 import { doctor, startDoctor } from './doctor.ts';
 import * as tmdb from './tmdb.ts';
 import {
@@ -58,9 +59,11 @@ import {
   deleteDownload,
   deleteDownloadFile,
   discardPreview,
+  episodeOf,
   finishedFilePath,
   folderName,
   getTorrent,
+  hasEpisodeDownload,
   markPlayed,
   migrateLegacyFolders,
   prewarm,
@@ -213,15 +216,59 @@ app.post('/api/parent/pin', (req, res) => {
 
 // --- catalog --------------------------------------------------------------------
 
-function continueWatching(profileId: string): Progress[] {
+/** A Continue Watching entry; `upNext` marks the episode after one just finished. */
+type ContinueEntry = Progress & { upNext?: boolean };
+
+/**
+ * The episode to offer after finishing `season`/`episode`: the next aired one, in this season or the
+ * first of the next, skipping episodes already watched to the end. Null when nothing newer is out yet.
+ */
+async function nextEpisodeAfter(tmdbId: number, season: number, episode: number, progress: Record<string, Progress>) {
+  const out = tmdb.today();
+  for (const [s, after] of [[season, episode], [season + 1, 0]] as const) {
+    const eps = await tmdb.season(tmdbId, s).catch(() => [] as tmdb.Episode[]);
+    for (const e of eps.filter((e) => e.number > after).sort((a, b) => a.number - b.number)) {
+      if (!e.airDate || e.airDate > out) return null;
+      const seen = progress[progressKey('tv', tmdbId, s, e.number)];
+      if (seen && seen.duration > 0 && seen.position / seen.duration >= FINISHED) continue;
+      return { season: s, episode: e, seen };
+    }
+  }
+  return null;
+}
+
+async function continueWatching(profileId: string): Promise<ContinueEntry[]> {
+  const progress = profileData(profileId).progress;
   const latestPerTitle = new Map<string, Progress>();
-  for (const p of Object.values(profileData(profileId).progress)) {
+  for (const p of Object.values(progress)) {
     const k = `${p.mediaType}:${p.tmdbId}`;
     const cur = latestPerTitle.get(k);
     if (!cur || p.updatedAt > cur.updatedAt) latestPerTitle.set(k, p);
   }
-  return [...latestPerTitle.values()]
-    .filter((p) => p.duration > 0 && p.position / p.duration < FINISHED && p.position > 30)
+  const entries = await Promise.all(
+    [...latestPerTitle.values()].map(async (p): Promise<ContinueEntry | null> => {
+      if (!(p.duration > 0)) return null;
+      if (p.position / p.duration < FINISHED) return p.position > 30 ? p : null;
+      // Finished an episode: keep the show, pointing at the next one (resuming it if started).
+      if (p.mediaType !== 'tv' || p.season == null || p.episode == null) return null;
+      const next = await nextEpisodeAfter(p.tmdbId, p.season, p.episode, progress);
+      if (!next) return null;
+      const { episode: e, seen } = next;
+      return {
+        ...p,
+        season: next.season,
+        episode: e.number,
+        episodeTitle: e.name,
+        position: seen?.position || 0,
+        duration: seen?.duration || (e.runtime || 0) * 60,
+        infoHash: seen?.infoHash || '',
+        fileIdx: seen?.fileIdx ?? -1,
+        upNext: !seen,
+      };
+    }),
+  );
+  return entries
+    .filter((p): p is ContinueEntry => !!p)
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, 20);
 }
@@ -238,7 +285,7 @@ app.get('/api/home', async (_req, res) => {
   const profile = profileOf(res);
   const data = profileData(profile.id);
   const rows = profile.kind === 'kid' ? await tmdb.kidsRows(undefined, profile.languages, profile.maxAge) : await tmdb.homeRows(profile.languages);
-  res.json({ continueWatching: continueWatching(profile.id), myList: data.myList, suggestions: await suggestionRows(profile), rows: await filterRows(res, rows) });
+  res.json({ continueWatching: await continueWatching(profile.id), myList: data.myList, suggestions: await suggestionRows(profile), rows: await filterRows(res, rows) });
 });
 
 // --- suggestions -------------------------------------------------------------------------------
@@ -365,10 +412,13 @@ app.get('/api/title/tv/:id/season/:n', async (req, res) => {
       const dl = downloads
         .filter((d) => d.episode === e.number && (d.complete || d.downloading))
         .sort((a, b) => Number(b.complete) - Number(a.complete) || b.progress - a.progress)[0];
+      // Asked to download but no source yet: FreeStream is finding one in the background.
+      const w = db.watches[watchKey('tv', id, n, e.number)];
       return {
         ...e,
         progress: p ? Math.min(1, p.position / (p.duration || 1)) : 0,
         download: dl ? { infoHash: dl.infoHash, fileIdx: dl.fileIdx, progress: dl.progress, complete: dl.complete, downloading: dl.downloading } : null,
+        finding: !dl && w?.download && w.status === 'waiting' ? w.note : null,
         // The source this episode would play from (its own choice, else the season pack).
         source: (() => {
           const src = sourceFor('tv', id, n, e.number);
@@ -378,6 +428,8 @@ app.get('/api/title/tv/:id/season/:n', async (req, res) => {
     }),
     savedSource: db.sources[sourceKey('tv', id, n)] || null,
     downloads,
+    /** Set while new episodes of this season download as they air. */
+    follow: db.watches[followKey(id, n)] || null,
   });
 });
 
@@ -548,6 +600,96 @@ app.post('/api/download', adultsOnly, async (req, res) => {
   res.json({ status, infoHash: t.infoHash, fileIdx, fileName: t.files[fileIdx].name });
 });
 
+/**
+ * The file for one episode, or null when this torrent doesn't have it. `strict` also requires the
+ * file to be named as that episode, so a single unnamed video isn't taken for every episode.
+ */
+function episodeFile(t: Torrent, season: number, episode: number, strict: boolean): number | null {
+  try {
+    const idx = pickFile(t, season, episode);
+    if (!strict) return idx;
+    const named = episodeOf(t.files[idx].path);
+    return named && named.s === season && named.e === episode ? idx : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Several episodes at once (Download season, Rest of season, or picked episodes). Each comes from the
+ * chosen season pack if it has it, else the episode's remembered source, else FreeStream finds one in
+ * the background (a download watch, listed under Watching). `follow` also downloads the season's new
+ * episodes as they air.
+ */
+app.post('/api/download/episodes', adultsOnly, async (req, res) => {
+  const b = req.body as { tmdbId: number; season: number; episodes?: unknown; source?: SavedSource; follow?: boolean };
+  const tmdbId = int(b.tmdbId, 'tmdbId');
+  const season = int(b.season, 'season');
+  if (!Array.isArray(b.episodes) || b.episodes.length > 500) throw new HttpError(400, 'episodes must be a list of episode numbers');
+  const wanted = [...new Set(b.episodes.map((e) => int(e, 'episode')))].sort((x, y) => x - y);
+  const title = await titleFor('tv', tmdbId);
+
+  const already = wanted.filter((e) => hasEpisodeDownload(tmdbId, season, e));
+  let todo = wanted.filter((e) => !already.includes(e));
+  const started: number[] = [];
+  let size = 0;
+  const tried = new Set<string>();
+
+  /** Starts the episodes this torrent has; returns the ones it doesn't. */
+  const takeFrom = (t: Torrent, source: SavedSource, eps: number[], strict: boolean): number[] => {
+    tried.add(t.infoHash);
+    const saved: SavedSource = { magnet: source.magnet, downloadUrl: source.downloadUrl, infoHash: t.infoHash, releaseTitle: source.releaseTitle || t.name };
+    return eps.filter((e) => {
+      const idx = episodeFile(t, season, e, strict);
+      if (idx == null) return true;
+      if (startDownload(t, idx, { season, episode: e }) === 'started') {
+        started.push(e);
+        size += t.files[idx].length;
+      } else already.push(e);
+      rememberSource('tv', tmdbId, saved, { season, episode: e, seasonPack: isSeasonPack(t) });
+      return false;
+    });
+  };
+
+  // 1. The season pack chosen for this batch (its errors, like no peers, go back to the picker).
+  if (b.source && todo.length) todo = takeFrom(await addSource(b.source, title), b.source, todo, true);
+
+  // 2. What's remembered: an episode's own source, else the season's pack. One torrent at a time.
+  const groups = new Map<string, { source: SavedSource; strict: boolean; eps: number[] }>();
+  for (const e of todo) {
+    const own = db.sources[episodeSourceKey(tmdbId, season, e)];
+    const source = own || db.sources[sourceKey('tv', tmdbId, season)];
+    if (!source || (source.infoHash && tried.has(source.infoHash))) continue;
+    const key = `${source.infoHash || source.magnet || source.downloadUrl}|${own ? 'own' : 'season'}`;
+    const g = groups.get(key) || { source, strict: !own, eps: [] };
+    g.eps.push(e);
+    groups.set(key, g);
+  }
+  for (const g of groups.values()) {
+    try {
+      const missing = takeFrom(await addSource(g.source, title), g.source, g.eps, g.strict);
+      todo = todo.filter((e) => !g.eps.includes(e) || missing.includes(e));
+    } catch (e) {
+      console.error(`[download] remembered source failed (${g.source.releaseTitle}):`, (e as Error).message);
+    }
+  }
+
+  // 3. No source yet: find, check and download one for each in the background.
+  for (const e of todo) await addWatch({ mediaType: 'tv', tmdbId, season, episode: e, reason: 'release', download: true });
+
+  // 4. New episodes, as they air (from the first one that isn't out yet).
+  if (b.follow) {
+    const eps = await tmdb.season(tmdbId, season);
+    const today = tmdb.today();
+    const upcoming = eps.filter((e) => !e.airDate || e.airDate > today).map((e) => e.number);
+    const fromEpisode = upcoming.length ? Math.min(...upcoming) : Math.max(0, ...eps.map((e) => e.number)) + 1;
+    await addWatch({ mediaType: 'tv', tmdbId, season, reason: 'follow', download: true, fromEpisode });
+  }
+  save();
+  if (started.length) console.log(`[download] ${title.title || tmdbId}: S${season} episodes ${started.join(', ')}`);
+  res.json({ started, already: already.sort((x, y) => x - y), searching: todo, following: !!b.follow, size });
+});
+
 /** Title page opened: connect to the remembered source's peers now, so Play starts faster. */
 app.post('/api/prewarm', async (req, res) => {
   const b = req.body as { mediaType: MediaType; tmdbId: number; season?: number; episode?: number };
@@ -672,14 +814,6 @@ app.get('/api/media/:hash/:idx', async (req, res) => {
 });
 
 /** Where a copied-video conversion starting near `at` really starts (the keyframe at or before it). */
-app.get('/api/convert/:hash/:idx/start', async (req, res) => {
-  const t = await getTorrent(hash(req.params.hash));
-  const idx = int(req.params.idx, 'file');
-  if (!t.files[idx]) throw new HttpError(404, 'No such file');
-  const at = Math.max(0, Number(req.query.at) || 0);
-  res.json({ start: hasFfmpeg ? await keyframeAt(t.infoHash, idx, at, req.query.preview !== undefined) : at });
-});
-
 /** Live ffmpeg conversion to fragmented MP4: AAC audio, video copied or re-encoded to H.264. */
 app.get('/api/convert/:hash/:idx', async (req, res) => {
   if (!hasFfmpeg) throw new HttpError(501, 'ffmpeg isn’t installed on the server, so files can’t be converted.');
@@ -696,7 +830,6 @@ app.get('/api/convert/:hash/:idx', async (req, res) => {
     audioTrack: Math.max(0, optInt(req.query.audio, 'audio') || 0),
     videoCodec: info?.videoCodec || '',
     interlaced: !!info?.interlaced,
-    videoDelaySec: info?.videoDelaySec || 0,
     preview,
     audioCodec: req.query.acodec === 'ac3' ? 'ac3' : 'aac',
     audioChannels: info?.audio[Math.max(0, optInt(req.query.audio, 'audio') || 0)]?.channels || 2,

@@ -14,7 +14,14 @@ const STATUS: Record<Watch['status'], { text: string; tone: 'good' | 'accent' | 
   'gave-up': { text: 'Stopped', tone: 'plain' },
 };
 
-/** Titles FreeStream is looking out for: "Notify me" releases and better versions of theater copies. */
+/** What a watch is for, in a few words. */
+function purpose(w: Watch): string {
+  if (w.reason === 'follow') return 'Downloads new episodes as they air';
+  if (w.reason === 'upgrade') return 'Better version of a theater copy';
+  return w.download ? 'Download once a good source is found' : 'Notify when out';
+}
+
+/** Titles FreeStream is looking out for: "Notify me" releases, better versions of theater copies, episodes to download. */
 export function Watching() {
   const navigate = useNavigate();
   const [watches, setWatches] = useState<Watch[] | null>(null);
@@ -57,7 +64,7 @@ export function Watching() {
       <h1 className="page-title">Watching</h1>
       <p className="muted">
         FreeStream checks these in the background and verifies what it finds (runtime, files, AI). “Notify me” titles are picked up once they’re out digitally; theater copies you play
-        are upgraded when a proper release appears.
+        are upgraded when a proper release appears; episodes you asked to download without a source are downloaded once one is found, and followed seasons download each new episode.
       </p>
       {!watches.length ? (
         <Message title="Nothing being watched">Press “Notify me” on an upcoming or in-theaters title.</Message>
@@ -65,7 +72,7 @@ export function Watching() {
         <FocusGroup focusKey="watching" className="watch-list download-list">
           {watches.map((w, i) => {
             const st = STATUS[w.status];
-            const ep = episodeLabel(w.season, w.episode);
+            const ep = w.reason === 'follow' ? `Season ${w.season}` : episodeLabel(w.season, w.episode);
             return (
               <div className={`watch${w.status === 'found' ? ' is-found' : ''}`} key={w.key}>
                 <div className="watch-poster">{w.posterPath && <img src={img(w.posterPath, 'w185')} alt="" />}</div>
@@ -76,7 +83,7 @@ export function Watching() {
                   </div>
                   <div className="download-stats muted">
                     <Badge tone={st.tone}>{st.text}</Badge>
-                    <span>{w.reason === 'upgrade' ? 'Better version of a theater copy' : 'Notify when out'}</span>
+                    <span>{purpose(w)}</span>
                   </div>
                   <div className="muted small">{w.note}</div>
                 </Focusable>

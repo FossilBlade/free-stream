@@ -61,15 +61,24 @@ export function Player() {
   const [countdown, setCountdown] = useState<number | null>(null);
   // Direct play, or ffmpeg conversion on the server (decided from the file's real codecs).
   const [mode, setMode] = useState<PlayMode | null>(null);
-  /** Converted streams start at `offset` seconds into the file; the video element's clock starts at 0. */
-  const [offset, setOffset] = useState(0);
+  /** Where the current conversion was asked to start (the stream itself begins at the keyframe before it). */
+  const [convertStart, setConvertStart] = useState(0);
+  /**
+   * Converted streams carry the file's own timestamps, so the video clock is the position in the file.
+   * Only a browser that restarts the clock at 0 gets the requested start added back here.
+   */
+  const [clockBase, setClockBase] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
   /** Audio tracks in the file, and the one playing (chosen from the profile's languages). */
   const [audioTracks, setAudioTracks] = useState<MediaInfo['audio']>([]);
   const [audioIdx, setAudioIdx] = useState(0);
   const [audioCursor, setAudioCursor] = useState(0);
   const modeRef = useRef<PlayMode | null>(null);
-  const offsetRef = useRef(0);
+  const clockBaseRef = useRef(0);
+  /** The video clock where the converted stream begins (browsers report everything before it as buffered). */
+  const streamStart = useRef(0);
+  /** Whether this converted stream's clock has been checked (Chrome reports 0 until the first frame plays). */
+  const clockKnown = useRef(false);
   const mediaDurRef = useRef(0);
   const mediaRef = useRef<MediaInfo | null>(null);
   const canConvertRef = useRef(false);
@@ -79,24 +88,19 @@ export function Player() {
   const directStartAt = useRef<number | null>(null);
   const seekTimer = useRef<number | undefined>(undefined);
   modeRef.current = mode;
-  offsetRef.current = offset;
+  clockBaseRef.current = clockBase;
   mediaDurRef.current = mediaDuration;
   const converting = mode?.kind === 'convert';
   const infoRef = useRef<PlayInfo | null>(null);
   infoRef.current = info;
 
-  /**
-   * Start (or restart) conversion near `t` seconds. Copied video can only start on a keyframe, so ask
-   * the server where that is and start there: audio and video then begin at the same moment.
-   */
-  const convertFrom = useCallback(async (t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
-    const i = infoRef.current;
-    if (!i) return;
-    const start = m.video === 'copy' && t > 0 ? await api.convertStart(i.infoHash, i.fileIdx, t).catch(() => t) : t;
-    if (infoRef.current !== i) return;
-    timeRef.current = start;
-    setTime(start);
-    setOffset(start);
+  /** Start (or restart) the conversion at `t` seconds into the file. */
+  const convertFrom = useCallback((t: number, m: Extract<PlayMode, { kind: 'convert' }>) => {
+    if (!infoRef.current) return;
+    clockKnown.current = false;
+    timeRef.current = t;
+    setTime(t);
+    setConvertStart(t);
     setMode(m);
   }, []);
   const hideTimer = useRef<number | undefined>(undefined);
@@ -124,7 +128,8 @@ export function Player() {
     setCountdown(null);
     setWaiting(true);
     setMode(null);
-    setOffset(0);
+    setConvertStart(0);
+    setClockBase(0);
     setMediaDuration(0);
     setAudioTracks([]);
     setAudioIdx(0);
@@ -203,8 +208,11 @@ export function Player() {
   }, [info, convertFrom]);
   useEffect(() => () => window.clearTimeout(seekTimer.current), []);
 
-  /** Position in the file (converted streams add their start offset). */
-  const absTime = useCallback(() => (video.current?.currentTime || 0) + (modeRef.current?.kind === 'convert' ? offsetRef.current : 0), []);
+  /** Position in the file. */
+  const absTime = useCallback(() => {
+    if (modeRef.current?.kind !== 'convert') return video.current?.currentTime || 0;
+    return clockKnown.current ? (video.current?.currentTime || 0) + clockBaseRef.current : timeRef.current;
+  }, []);
   const totalDuration = useCallback(() => {
     const d = video.current?.duration;
     if (modeRef.current?.kind === 'convert') return mediaDurRef.current;
@@ -237,7 +245,7 @@ export function Player() {
       const s = saveState.current;
       const dur = totalDuration();
       const pos = pendingSeek.current ?? absTime();
-      if (!v || !s.info || !dur || pos < 5) return;
+      if (!v || !s.info || !dur || pos < 5 || pos > dur + 5) return;
       const body = {
         mediaType: type,
         tmdbId: id,
@@ -328,9 +336,9 @@ export function Player() {
         v.currentTime = target;
         return;
       }
-      const rel = target - offsetRef.current;
+      const rel = target - clockBaseRef.current;
       const b = v.buffered;
-      for (let i = 0; i < b.length; i++) {
+      for (let i = 0; i < b.length && rel >= streamStart.current; i++) {
         if (rel >= b.start(i) && rel <= b.end(i) - 1) {
           v.currentTime = rel;
           return;
@@ -343,9 +351,8 @@ export function Player() {
       seekTimer.current = window.setTimeout(() => {
         const m = modeRef.current;
         if (m?.kind !== 'convert') return;
-        convertFrom(target, m).finally(() => {
-          if (pendingSeek.current === target) pendingSeek.current = null;
-        });
+        convertFrom(target, m);
+        if (pendingSeek.current === target) pendingSeek.current = null;
       }, 600);
     },
     [totalDuration, setStall, convertFrom],
@@ -402,7 +409,6 @@ export function Player() {
     if (next.kind === 'direct') {
       // Back to the file's own default track: play the original again, from the same place.
       directStartAt.current = absTime();
-      setOffset(0);
       setMode(next);
       return;
     }
@@ -535,8 +541,9 @@ export function Player() {
   const onLoadedMetadata = () => {
     const v = video.current!;
     setDuration(totalDuration());
-    // Converted streams already start at the resume point (or the seek target).
-    if (!converting) {
+    // Converted streams start at the resume point (or seek target); their clock is checked once they play.
+    if (converting) clockKnown.current = false;
+    else {
       const startAt = directStartAt.current ?? info?.resumeAt ?? 0;
       directStartAt.current = null;
       if (startAt && startAt < v.duration - 10) v.currentTime = startAt;
@@ -549,8 +556,18 @@ export function Player() {
     const v = video.current!;
     if (!v.paused && v.currentTime !== lastTime.current && lastTime.current >= 0) setStall(false);
     lastTime.current = v.currentTime;
+    if (converting && !clockKnown.current) {
+      if (v.currentTime <= 0) return;
+      // The stream carries the file's timestamps, starting at the keyframe just before the requested point.
+      // A browser that restarts the clock at 0 instead shows far less than that: add the start back.
+      const rebased = convertStart > 30 && v.currentTime < convertStart - 30;
+      clockBaseRef.current = rebased ? convertStart : 0;
+      setClockBase(clockBaseRef.current);
+      streamStart.current = v.currentTime;
+      clockKnown.current = true;
+    }
     if (pendingSeek.current != null) return; // the bar shows the seek target until the restart
-    const base = converting ? offset : 0;
+    const base = converting ? clockBaseRef.current : 0;
     timeRef.current = base + v.currentTime;
     setTime(base + v.currentTime);
     const b = v.buffered;
@@ -619,10 +636,10 @@ export function Player() {
       {info && mode && (
         <video
           ref={video}
-          key={`${info.infoHash}-${info.fileIdx}-${mode.kind}-${mode.kind === 'convert' ? `${mode.video}-${offset}-${mode.audio ?? 0}` : ''}`}
+          key={`${info.infoHash}-${info.fileIdx}-${mode.kind}-${mode.kind === 'convert' ? `${mode.video}-${convertStart}-${mode.audio ?? 0}` : ''}`}
           src={
             mode.kind === 'convert'
-              ? convertUrl(info, offset, mode.video, false, mode.audio ?? 0, convertAudioCodec(audioTracks[mode.audio ?? 0]))
+              ? convertUrl(info, convertStart, mode.video, false, mode.audio ?? 0, convertAudioCodec(audioTracks[mode.audio ?? 0]))
               : streamUrl(info)
           }
           autoPlay
@@ -657,7 +674,7 @@ export function Player() {
             <track
               key={subIdx}
               kind="subtitles"
-              src={subtitleUrl(info.infoHash, subIdx, converting ? offset : 0)}
+              src={subtitleUrl(info.infoHash, subIdx, converting ? clockBase : 0)}
               srcLang="en"
               label={subtitles.find((s) => s.idx === subIdx)?.label}
               default

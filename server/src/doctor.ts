@@ -98,11 +98,23 @@ async function checkIndexers(): Promise<HealthCheck[]> {
   }
   const out: HealthCheck[] = [{ id: 'indexer', name, status: 'ok', detail: conn.message }];
 
+  // Prowlarr's own list: removed or turned-off indexers no longer slow searches, so their history doesn't count.
+  const headers = { 'X-Api-Key': s.indexerApiKey };
+  let indexers: { id: number; name: string; enable: boolean }[] | null = null;
+  if (s.indexerType === 'prowlarr') {
+    try {
+      indexers = await getJson<{ id: number; name: string; enable: boolean }[]>(`${s.indexerUrl}/api/v1/indexer`, headers);
+    } catch {
+      /* the connection check above already covers Prowlarr being unreachable */
+    }
+  }
+
   // Indexers that keep failing slow every search down (each gets up to 25 s).
   const health = db.indexerHealth || {};
   const recentCut = Date.now() - 14 * 24 * 3600 * 1000;
   for (const [ix, h] of Object.entries(health)) {
     if (h.lastAt < recentCut || h.recent.length < 3) continue;
+    if (indexers && !indexers.some((i) => i.name === ix && i.enable)) continue;
     const fails = h.recent.filter((x) => x === 0).length;
     if (fails / h.recent.length < 0.5) continue;
     out.push({
@@ -115,13 +127,9 @@ async function checkIndexers(): Promise<HealthCheck[]> {
   }
 
   // Prowlarr also pauses indexers itself after repeated errors.
-  if (s.indexerType === 'prowlarr') {
+  if (indexers) {
     try {
-      const headers = { 'X-Api-Key': s.indexerApiKey };
-      const [statuses, indexers] = await Promise.all([
-        getJson<{ indexerId: number; disabledTill?: string }[]>(`${s.indexerUrl}/api/v1/indexerstatus`, headers),
-        getJson<{ id: number; name: string; enable: boolean }[]>(`${s.indexerUrl}/api/v1/indexer`, headers),
-      ]);
+      const statuses = await getJson<{ indexerId: number; disabledTill?: string }[]>(`${s.indexerUrl}/api/v1/indexerstatus`, headers);
       for (const st of statuses) {
         if (!st.disabledTill || Date.parse(st.disabledTill) < Date.now()) continue;
         const ix = indexers.find((i) => i.id === st.indexerId);

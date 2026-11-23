@@ -2285,3 +2285,41 @@ html.tv .player video::cue {
   margin-left: 0.5rem;
   flex-shrink: 0;
 }
+
+/* ---------- title page: downloading several episodes ---------- */
+
+.season-actions {
+  margin-bottom: 1rem;
+}
+.episode-check {
+  flex-shrink: 0;
+  margin-right: 0.85rem;
+  color: var(--muted);
+  display: flex;
+}
+.episode-check svg {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+.episode-row.is-selected .episode {
+  background: var(--teal-soft);
+  border-color: var(--teal);
+}
+.episode-row.is-selected .episode-check {
+  color: var(--teal);
+}
+.episode-row.is-unselectable .episode {
+  opacity: 0.45;
+}
+.episode-row.is-picking .card-play {
+  display: none;
+}
+.episode-download.is-finding {
+  color: var(--amber);
+}
+.batch-follow {
+  margin-top: 0.75rem;
+}
+.batch-actions {
+  margin-top: 0.5rem;
+}

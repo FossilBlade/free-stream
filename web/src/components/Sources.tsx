@@ -1,6 +1,6 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
 import { CheckCircle2, ChevronDown, ChevronRight, Clapperboard, Download, Eye, RefreshCw, Sparkles, Users } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, ApiError, downloadMessage, formatBytes, OUTCOME_TONE, releaseSource, type DownloadRow, type MediaType, type Release, type SavedSource } from '../api';
 import { screenHeight } from '../screen';
@@ -23,7 +23,16 @@ function playNote(r: Release, canConvert: boolean): 'convert' | 'risky' | null {
   return r.playability === 'risky' ? 'risky' : null;
 }
 
-export type PickMode = 'play' | 'download';
+/** Covers this season: a pack of it, or a multi-season pack (e.g. "S01-S05") that includes it. */
+function packCovers(r: Release, season: number | undefined): boolean {
+  if (!r.info.pack) return false;
+  if (season == null || r.info.season == null || r.info.season === season) return true;
+  const range = r.title.match(/\bS(?:easons?)?\s?(\d{1,2})\s?-\s?S?(\d{1,2})\b/i);
+  return !!range && Number(range[1]) <= season && season <= Number(range[2]);
+}
+
+/** play/download one movie or episode, or pack: a full-season source for several episodes at once. */
+export type PickMode = 'play' | 'download' | 'pack';
 
 export interface SourcesProps {
   mediaType: MediaType;
@@ -43,11 +52,19 @@ export interface SourcesProps {
   downloads?: DownloadRow[];
   onDownloaded?: () => void;
   onPlay: (source: SavedSource) => void;
+  /** pack mode: a season pack was chosen. */
+  onPack?: (source: SavedSource) => void;
+  /** pack mode: the episode Preview opens (the search itself is for the whole season). */
+  previewEpisode?: number;
+  /** Shown under the heading / after the list (pack mode: options and the no-pack fallback). */
+  extra?: ReactNode;
+  footer?: ReactNode;
 }
 
 type Filter = 'all' | '2160p' | '1080p' | '720p';
 
-export function Sources({ mediaType, tmdbId, title, year, season, episode, mode, subtitle, theaterFocus, busy, downloads = [], onDownloaded, onPlay }: SourcesProps) {
+export function Sources({ mediaType, tmdbId, title, year, season, episode, mode, subtitle, theaterFocus, busy, downloads = [], onDownloaded, onPlay, onPack, previewEpisode, extra, footer }: SourcesProps) {
+  const packs = mode === 'pack';
   const navigate = useNavigate();
   const [releases, setReleases] = useState<Release[] | null>(null);
   const [canConvert, setCanConvert] = useState(false);
@@ -75,11 +92,12 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
   }, [mediaType, title, year, season, episode, attempt]);
 
   // Once results arrive, put the remote on the best source (or on "Search again" if there's nothing to pick).
+  const anyShown = !!releases && (packs ? releases.some((r) => packCovers(r, season)) : releases.length > 0);
   useEffect(() => {
     if (!releases && !error) return;
-    const t = setTimeout(() => setFocus(releases && releases.length ? 'sources-list' : 'sources-retry'), 60);
+    const t = setTimeout(() => setFocus(anyShown ? 'sources-list' : 'sources-retry'), 60);
     return () => clearTimeout(t);
-  }, [releases, error]);
+  }, [releases, error, anyShown]);
 
   const downloadedBy = useMemo(() => {
     const m = new Map<string, DownloadRow>();
@@ -87,7 +105,8 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
     return m;
   }, [downloads]);
 
-  const shown = useMemo(() => (releases || []).filter((r) => filter === 'all' || r.info.resolution === filter), [releases, filter]);
+  const candidates = useMemo(() => (packs ? (releases || []).filter((r) => packCovers(r, season)) : releases || []), [releases, packs, season]);
+  const shown = useMemo(() => candidates.filter((r) => filter === 'all' || r.info.resolution === filter), [candidates, filter]);
   // The best pick goes first; the rest keep the server's order.
   const full = shown.filter((r) => r.tier === 'full').sort((a, b) => Number(!!b.best) - Number(!!a.best));
   const theater = shown.filter((r) => r.tier === 'theater');
@@ -95,9 +114,9 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
-    for (const r of releases || []) if (r.info.resolution) c[r.info.resolution] = (c[r.info.resolution] || 0) + 1;
+    for (const r of candidates) if (r.info.resolution) c[r.info.resolution] = (c[r.info.resolution] || 0) + 1;
     return c;
-  }, [releases]);
+  }, [candidates]);
 
   const download = async (source: SavedSource) => {
     try {
@@ -109,7 +128,7 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
     }
   };
 
-  const choose = (r: Release) => (mode === 'download' ? download(releaseSource(r)) : onPlay(releaseSource(r)));
+  const choose = (r: Release) => (packs ? onPack?.(releaseSource(r)) : mode === 'download' ? download(releaseSource(r)) : onPlay(releaseSource(r)));
 
   const renderRow = (r: Release) => {
     const dl = r.infoHash ? downloadedBy.get(r.infoHash) : undefined;
@@ -123,7 +142,7 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
                 <Sparkles className="inline-icon" /> Best pick
               </Badge>
             )}
-            {dl && <Badge tone="good">{dl.complete ? '✓ On this Mac' : `Downloading ${Math.floor(dl.progress * 100)}%`}</Badge>}
+            {dl && <Badge tone="good">{packs ? 'Already in use' : dl.complete ? '✓ On this Mac' : `Downloading ${Math.floor(dl.progress * 100)}%`}</Badge>}
             {r.info.resolution && <Badge tone="accent">{r.info.resolution === '2160p' ? '4K' : r.info.resolution}</Badge>}
             {r.tier === 'theater' && <Badge tone="ok">{r.info.theater === 'screener' ? 'Screener' : 'Theater recording'}</Badge>}
             {r.info.multiAudio ? <Badge title="Several audio languages: FreeStream plays your profile’s language and you can switch with Audio in the player. Preview lists the tracks.">Dual audio</Badge> : r.info.languages.slice(0, 2).map((l) => <Badge key={l}>{l}</Badge>)}
@@ -152,7 +171,7 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
           <Eye />
           <span>Preview</span>
         </Focusable>
-        {dl?.complete ? (
+        {packs ? null : dl?.complete ? (
           <Focusable className="btn btn-secondary release-download is-done" disabled={busy} title="On this Mac — play it" onSelect={() => onPlay(releaseSource(r))}>
             <CheckCircle2 />
             <span>Downloaded</span>
@@ -180,8 +199,9 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
   return (
     <section className="sources">
       <div className="sources-head">
-        <h2>{mode === 'download' ? 'Choose a source to download' : 'Choose a source to watch'}</h2>
+        <h2>{packs ? 'Choose a full-season source' : mode === 'download' ? 'Choose a source to download' : 'Choose a source to watch'}</h2>
         {subtitle && <p className="muted">{subtitle}</p>}
+        {extra}
       </div>
 
       {error ? (
@@ -199,8 +219,10 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
         )
       ) : !releases ? (
         <Spinner label="Searching…" />
-      ) : !releases.length ? (
-        <Message title="No sources found" action={retry} />
+      ) : !candidates.length ? (
+        <Message title={packs ? 'No full-season sources found' : 'No sources found'} action={retry}>
+          {packs ? 'FreeStream can find each episode on its own instead (below).' : undefined}
+        </Message>
       ) : (
         <>
           <FocusGroup focusKey="sources-filters" className="chips">
@@ -230,6 +252,7 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
           </FocusGroup>
         </>
       )}
+      {footer}
 
       {preview && (
         <PreviewModal
@@ -238,14 +261,15 @@ export function Sources({ mediaType, tmdbId, title, year, season, episode, mode,
           mediaType={mediaType}
           tmdbId={tmdbId}
           season={season}
-          episode={episode}
+          episode={packs ? previewEpisode : episode}
           onClose={() => {
             setPreview(null);
             setTimeout(() => setFocus('sources-list'), 50);
           }}
           onDownload={(src) => {
             setPreview(null);
-            download(src);
+            if (packs) onPack?.(src);
+            else download(src);
           }}
           onWatch={(src) => {
             setPreview(null);
