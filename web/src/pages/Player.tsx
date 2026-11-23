@@ -1,8 +1,9 @@
 import { pause as pauseNav, resume as resumeNav } from '@noriginmedia/norigin-spatial-navigation';
-import { AlertTriangle, ArrowLeft, AudioLines, Captions, Maximize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, AudioLines, Captions, Layers, Maximize, Pause, Play, RotateCcw, RotateCw, SkipForward, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, subtitleUrl, type Details, type Episode, type MediaInfo, type MediaType, type PlayInfo, type TorrentStatus } from '../api';
+import { api, ApiError, convertUrl, formatBytes, formatTime, streamUrl, subtitleUrl, type Details, type Episode, type MediaInfo, type MediaType, type PlayInfo, type Release, type TorrentStatus } from '../api';
+import { autoCandidates, shortLabel, sourceOf } from '../autoPick';
 import { runBackHandlers } from '../back';
 import { Spinner } from '../components/ui';
 import {
@@ -26,7 +27,15 @@ const SAVE_EVERY_MS = 10000;
 const UP_NEXT_SECONDS = 30;
 
 type Zone = 'timeline' | 'buttons' | 'subs' | 'audio';
-type ButtonId = 'play' | 'back10' | 'fwd10' | 'subs' | 'audio' | 'next' | 'mute' | 'fullscreen';
+type ButtonId = 'play' | 'back10' | 'fwd10' | 'subs' | 'audio' | 'next' | 'source' | 'mute' | 'fullscreen';
+
+/** A source picked automatically that hasn't started: give up on it with no peers after this long, */
+const NO_PEERS_MS = 30000;
+/** or when it's still barely moving after this long. */
+const TOO_SLOW_MS = 90000;
+const TOO_SLOW_BPS = 250_000;
+/** Opening an automatically picked source (finding peers, reading the file list) gets this long. */
+const OPEN_MS = 40000;
 
 export function Player() {
   const { type: typeParam, id: idParam } = useParams();
@@ -37,7 +46,7 @@ export function Player() {
   const episode = params.get('episode') ? Number(params.get('episode')) : undefined;
   const location = useLocation();
   const navigate = useNavigate();
-  const { profile } = useProfile();
+  const { profile, isKid } = useProfile();
 
   const video = useRef<HTMLVideoElement>(null);
   const [info, setInfo] = useState<PlayInfo | null>(null);
@@ -53,6 +62,18 @@ export function Player() {
   const [muted, setMuted] = useState(false);
   const [subIdx, setSubIdx] = useState<number | null>(null);
   const [status, setStatus] = useState<TorrentStatus | null>(null);
+  /** Nothing chosen yet: the sources Play is trying by itself, best first, and which one is on. */
+  const autoRef = useRef<{ list: Release[]; i: number } | null>(null);
+  /** What the automatic pick is doing, shown while nothing plays yet. */
+  const [pickNote, setPickNote] = useState<string | null>(null);
+  /** Bumped on every new load, so a slow answer for an earlier one is ignored. */
+  const loadGen = useRef(0);
+  /** Bumped on every automatic attempt, so a source that answers after we moved on is ignored. */
+  const attemptRef = useRef(0);
+  /** The current source has started playing. */
+  const startedRef = useRef(false);
+  const statusRef = useRef<TorrentStatus | null>(null);
+  statusRef.current = status;
 
   const [visible, setVisible] = useState(true);
   const [zone, setZone] = useState<Zone>('timeline');
@@ -118,11 +139,11 @@ export function Player() {
   }, []);
   useEffect(() => () => window.clearTimeout(stallTimer.current), []);
 
-  // ---- load the stream (from the title page's state, or by asking the server) -------------------
-  useEffect(() => {
-    const fromState = (location.state as { play?: PlayInfo } | null)?.play;
+  /** Clears everything about the current stream before another one starts. */
+  const resetStream = () => {
     setInfo(null);
     setFatal(null);
+    setStatus(null);
     setTime(0);
     setDuration(0);
     setCountdown(null);
@@ -135,26 +156,104 @@ export function Player() {
     setAudioIdx(0);
     mediaRef.current = null;
     pendingSeek.current = null;
+    startedRef.current = false;
+  };
+
+  /** Moves on to the next automatically picked source; after the last one, hands over the full list. */
+  const tryNext = async (gen: number, why?: string) => {
+    const a = autoRef.current;
+    if (!a || gen !== loadGen.current) return;
+    a.i += 1;
+    const r = a.list[a.i];
+    if (!r) {
+      autoRef.current = null;
+      setPickNote(null);
+      // Don't come back to the last one that failed next time.
+      api.forgetSource(type, id, season, episode).catch(() => {});
+      setFatal({ message: `${why ? `${why} ` : ''}None of the top ${a.list.length} sources would play here. Choose one from the full list.`, canChangeSource: true });
+      return;
+    }
+    const attempt = ++attemptRef.current;
+    const current = () => gen === loadGen.current && attempt === attemptRef.current;
+    resetStream();
+    setPickNote(why ? `${why} Trying the next best (${a.i + 1} of ${a.list.length}) · ${shortLabel(r)}` : `Starting the best source · ${shortLabel(r)}`);
+    const tooLong = window.setTimeout(() => current() && tryNext(gen, 'That source didn’t respond.'), OPEN_MS);
+    try {
+      const p = await api.play({ mediaType: type, tmdbId: id, season, episode, source: sourceOf(r) });
+      if (current()) setInfo(p);
+    } catch {
+      if (current()) tryNext(gen, 'That source wouldn’t open.');
+    } finally {
+      window.clearTimeout(tooLong);
+    }
+  };
+
+  /** No source chosen yet: search, rank for this device, and start the best one. */
+  const startAuto = async (gen: number) => {
+    setPickNote('Finding the best source…');
+    try {
+      const d = (await api.title(type, id)).details;
+      const list = await autoCandidates(type, id, d.title, d.year, season, episode);
+      if (gen !== loadGen.current) return;
+      if (!list.length) {
+        setPickNote(null);
+        return setFatal({ message: 'Couldn’t find a source that should play well here. Choose one from the full list.', canChangeSource: true });
+      }
+      autoRef.current = { list, i: -1 };
+      tryNext(gen);
+    } catch (e) {
+      if (gen !== loadGen.current) return;
+      setPickNote(null);
+      setFatal({ message: (e as ApiError).message, canChangeSource: true });
+    }
+  };
+
+  // ---- load the stream (from the title page's state, or by asking the server) -------------------
+  useEffect(() => {
+    const fromState = (location.state as { play?: PlayInfo } | null)?.play;
+    const gen = ++loadGen.current;
+    autoRef.current = null;
+    setPickNote(null);
+    resetStream();
     if (fromState) {
       setInfo(fromState);
       return;
     }
-    let live = true;
     api
       .play({ mediaType: type, tmdbId: id, season, episode })
-      .then((p) => live && setInfo(p))
+      .then((p) => gen === loadGen.current && setInfo(p))
       .catch((e: ApiError) => {
-        if (!live) return;
+        if (gen !== loadGen.current) return;
         if (e.status === 409 || e.status === 422) {
+          // Nothing chosen for this yet (or the season pack lacks it): pick the best source automatically.
+          if (!isKid) return void startAuto(gen);
           navigate(`/title/${type}/${id}?pick=1${season != null ? `&season=${season}&episode=${episode}` : ''}`, { replace: true });
         } else setFatal({ message: e.message, canChangeSource: true });
       });
-    return () => {
-      live = false;
-    };
     // location.key changes when "next episode" replaces the route
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.key]);
+
+  // Picked automatically but not starting (nobody sharing it, or far too slow): move on by itself.
+  useEffect(() => {
+    if (!info || !autoRef.current) return;
+    const gen = loadGen.current;
+    const t0 = Date.now();
+    const timer = window.setInterval(() => {
+      if (startedRef.current || gen !== loadGen.current) return window.clearInterval(timer);
+      const st = statusRef.current?.infoHash === info.infoHash ? statusRef.current : null;
+      const age = Date.now() - t0;
+      if (age > NO_PEERS_MS && !st?.peers) {
+        window.clearInterval(timer);
+        tryNext(gen, 'Nobody is sharing that source right now.');
+      } else if (age > TOO_SLOW_MS && (st?.downloadSpeed || 0) < TOO_SLOW_BPS) {
+        window.clearInterval(timer);
+        tryNext(gen, 'That source is too slow to start.');
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info]);
 
   useEffect(() => {
     api
@@ -374,6 +473,12 @@ export function Player() {
     navigate(`/watch/tv/${id}?season=${nextEpisode.season}&episode=${nextEpisode.episode}`, { replace: true, state: null });
   }, [nextEpisode, navigate, id, saveProgress]);
 
+  /** Change source (player controls): the full list for this episode or movie; resumes where you are. */
+  const pickAnother = useCallback(() => {
+    saveProgress();
+    navigate(`/title/${type}/${id}?pick=1${season != null ? `&season=${season}&episode=${episode}` : ''}`, { replace: true });
+  }, [navigate, saveProgress, type, id, season, episode]);
+
   const changeSource = useCallback(async () => {
     await api.forgetSource(type, id, season).catch(() => {});
     navigate(`/title/${type}/${id}?pick=1${season != null ? `&season=${season}&episode=${episode}` : ''}`, { replace: true });
@@ -416,7 +521,7 @@ export function Player() {
   };
 
   const subtitles = info?.subtitles || [];
-  const buttons: ButtonId[] = ['play', 'back10', 'fwd10', ...(subtitles.length ? (['subs'] as ButtonId[]) : []), ...(audioTracks.length > 1 ? (['audio'] as ButtonId[]) : []), ...(nextEpisode ? (['next'] as ButtonId[]) : []), ...(isTV ? [] : (['mute', 'fullscreen'] as ButtonId[]))];
+  const buttons: ButtonId[] = ['play', 'back10', 'fwd10', ...(subtitles.length ? (['subs'] as ButtonId[]) : []), ...(audioTracks.length > 1 ? (['audio'] as ButtonId[]) : []), ...(nextEpisode ? (['next'] as ButtonId[]) : []), ...(isKid ? [] : (['source'] as ButtonId[])), ...(isTV ? [] : (['mute', 'fullscreen'] as ButtonId[]))];
 
   const activate = useCallback(
     (b: ButtonId) => {
@@ -430,10 +535,11 @@ export function Player() {
         setZone('audio');
         setAudioCursor(audioIdx);
       } else if (b === 'next') goNext();
+      else if (b === 'source') pickAnother();
       else if (b === 'mute') setMuted((m) => !m);
       else if (b === 'fullscreen') toggleFullscreen();
     },
-    [togglePlay, seekBy, goNext, toggleFullscreen, subIdx, subtitles, audioIdx],
+    [togglePlay, seekBy, goNext, pickAnother, toggleFullscreen, subIdx, subtitles, audioIdx],
   );
 
   // ---- up next prompt ---------------------------------------------------------------------------------
@@ -594,6 +700,12 @@ export function Player() {
         return;
       }
     }
+    // Picked automatically: try the next best instead of stopping here.
+    if (autoRef.current) {
+      saveProgress();
+      tryNext(loadGen.current, 'This device couldn’t play that source.');
+      return;
+    }
     setFatal({
       message:
         code === 4
@@ -661,7 +773,10 @@ export function Player() {
           onWaiting={() => setStall(true)}
           onSeeking={() => setStall(true)}
           onSeeked={() => video.current && video.current.readyState >= 3 && setStall(false)}
-          onPlaying={() => setStall(false)}
+          onPlaying={() => {
+            startedRef.current = true;
+            setStall(false);
+          }}
           onCanPlay={() => setStall(false)}
           onEnded={() => {
             saveProgress();
@@ -692,7 +807,7 @@ export function Player() {
           <Spinner
             label={
               !info
-                ? 'Finding peers and fetching the file list…'
+                ? pickNote || 'Finding peers and fetching the file list…'
                 : !mode
                   ? 'Checking the file format…'
                   : status
@@ -767,6 +882,7 @@ export function Player() {
             {subtitles.length > 0 && ctl('subs', <Captions />, 'Subtitles')}
             {audioTracks.length > 1 && ctl('audio', <AudioLines />, 'Audio')}
             {nextEpisode && ctl('next', <SkipForward />, 'Next episode')}
+            {!isKid && ctl('source', <Layers />, 'Change source')}
             {!isTV && ctl('mute', muted ? <VolumeX /> : <Volume2 />, muted ? 'Unmute' : 'Mute')}
             {!isTV && ctl('fullscreen', <Maximize />, 'Full screen')}
           </div>

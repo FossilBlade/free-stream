@@ -188,7 +188,12 @@ export function Title() {
         const err = e as ApiError;
         // Kids never see source lists: just say what happened.
         if (isKid) return void toast(err.message, 'error');
-        // No source yet / not in this season pack: just show the list. Real failures get a short note too.
+        // No source yet / not in this season pack: the player picks the best one itself.
+        if (!source && (err.status === 409 || err.status === 422)) {
+          const q = type === 'tv' ? `?season=${t.season}&episode=${t.episode}` : '';
+          return void navigate(`/watch/${type}/${id}${q}`);
+        }
+        // A chosen source that failed: say why and show the list again.
         if (err.status !== 409 && err.status !== 422) toast(err.message, 'error');
         openPicker(t, 'play');
       } finally {
@@ -212,7 +217,7 @@ export function Title() {
     [season, episodes, play, isKid],
   );
 
-  /** Play: a finished download first, then the remembered source, else pick one. */
+  /** Play: a finished download first, then the remembered source, else the player picks the best one. */
   const playMain = useCallback(() => {
     if (!details) return;
     if (isKid && type === 'movie') return void play({});
@@ -220,12 +225,12 @@ export function Title() {
       const sourceIsDownloaded = !!movieSource && downloads.some((d) => d.complete && d.infoHash === movieSource.infoHash);
       if (completeDl && !sourceIsDownloaded) play({}, { infoHash: completeDl.infoHash, releaseTitle: completeDl.releaseName });
       else if (movieSource) play({});
-      else openPicker({}, 'play');
+      else navigate(`/watch/movie/${id}`);
       return;
     }
     const t = mainTarget();
     playEpisode(t.season!, t.episode!);
-  }, [details, type, movieSource, downloads, completeDl, mainTarget, play, playEpisode, openPicker, isKid]);
+  }, [details, type, id, navigate, movieSource, downloads, completeDl, mainTarget, play, playEpisode, isKid]);
 
   // "Play" from the home banner lands here with ?play=1; the player sends ?pick=1 when a source is needed.
   useEffect(() => {
@@ -485,7 +490,7 @@ export function Title() {
             </div>
           )}
 
-          {!isKid && (completeDl || currentSource || resuming || sourceVerdict) && (
+          {!isKid && (completeDl || currentSource || resuming || sourceVerdict || release.state === 'available') && (
             <FocusGroup focusKey="title-links" className="title-links muted small">
               {completeDl ? (
                 <span>✓ On this Mac{sourceVerdict ? ` · ${sourceVerdict.label}` : ''}</span>
@@ -501,6 +506,14 @@ export function Title() {
                 <Focusable className="link-btn" scroll="top" onSelect={() => changeSource()}>
                   Change source
                 </Focusable>
+              )}
+              {!currentSource && !completeDl && release.state === 'available' && (
+                <>
+                  <span className="source-note">Play picks the best source automatically</span>
+                  <Focusable className="link-btn" scroll="top" onSelect={() => openPicker(mainTarget(), 'play')}>
+                    Choose one yourself
+                  </Focusable>
+                </>
               )}
               {resuming && (
                 <Focusable className="link-btn" scroll="top" onSelect={startOver}>
