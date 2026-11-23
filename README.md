@@ -12,6 +12,7 @@ Written in TypeScript: React + Vite on the front end, Express + WebTorrent on th
 - [Requirements](#requirements)
 - [Quick start (Docker)](#quick-start-docker)
 - [Setup without Docker](#setup-without-docker)
+- [Cloudflare-protected indexers](#cloudflare-protected-indexers)
 - [Watching on an LG TV](#watching-on-an-lg-tv)
 - [Configuration](#configuration)
 - [Health check](#health-check)
@@ -95,7 +96,7 @@ cp .env.example .env     # optional: set TZ and API keys here, or later in Setti
 npm run docker:up        # = docker compose up -d --build
 ```
 
-This starts FreeStream and Prowlarr. Both restart automatically whenever Docker starts.
+This starts FreeStream, Prowlarr and FlareSolverr (for [Cloudflare-protected indexers](#cloudflare-protected-indexers)). All three restart automatically whenever Docker starts.
 
 1. **Prowlarr:** open http://localhost:9696, add indexers (see [Starting indexers](#starting-indexers)), and copy the API key (Settings → General).
 2. **FreeStream:** open `http://<this computer's IP>:8080`; on a Mac, `ipconfig getifaddr en0` prints the IP. In **Settings**, add the TMDB key and the Prowlarr API key, set the Prowlarr URL to **`http://prowlarr:9696`** (the container name, not localhost), and press **Test connection**.
@@ -111,11 +112,10 @@ These public indexers need no account and work well together. In Prowlarr, go to
 | **The Pirate Bay** | Movies and shows; the widest selection, including Indian releases. |
 | **LimeTorrents** | Movies and shows; a useful second source for shows. |
 
-Skip **Internet Archive**. It mostly times out, and its results are rarely full films. (FreeStream gives each indexer 25 seconds and carries on without slow ones, but that makes every search take the full 25 seconds.) Indexers behind Cloudflare, such as 1337x, need FlareSolverr (see below).
+Skip **Internet Archive**. It mostly times out, and its results are rarely full films. (FreeStream gives each indexer 25 seconds and carries on without slow ones, but that makes every search take the full 25 seconds.) Indexers behind Cloudflare, such as 1337x, need one extra setting: see [Cloudflare-protected indexers](#cloudflare-protected-indexers).
 
 Also good to know:
 - **State** lives in `./data` (Prowlarr's config in `./data/prowlarr`). Downloads go to `~/Movies/FreeStream`.
-- **Cloudflare-protected indexers:** run `docker compose --profile flaresolverr up -d`, then in Prowlarr go to Settings → Indexers and add a FlareSolverr proxy at `http://flaresolverr:8191`.
 - **Logs:** `npm run docker:logs`. **Stop:** `npm run docker:down`.
 - **Sleep:** Docker doesn't keep the Mac awake. Prevent sleep in System Settings, or run `caffeinate -s` while watching.
 
@@ -128,6 +128,51 @@ npm start              # builds the web app, starts the server, keeps the Mac aw
 ```
 
 Install Prowlarr or Jackett yourself, add the [starting indexers](#starting-indexers), and use `http://localhost:9696` (Prowlarr) or `http://localhost:9117` (Jackett) as the indexer URL. If macOS asks whether `node` may accept incoming connections, click **Allow**, or other devices can't reach it.
+
+## Cloudflare-protected indexers
+
+Some indexers (1337x, for example) sit behind Cloudflare's "checking your browser" page, so Prowlarr's searches come back blocked. [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) fixes that: it opens the page in a headless Chrome, waits out the check, and hands the cookies back. Prowlarr reuses those cookies, so the slow browser step only happens now and then.
+
+### 1. Run FlareSolverr
+
+**With Docker (the Quick start):** it's already running as the `flaresolverr` container. Prowlarr reaches it at `http://flaresolverr:8191`. Its port is open to this computer only, not the rest of the network.
+
+**Without Docker:** pick one, then check it answers at http://localhost:8191 ("FlareSolverr is ready!").
+
+- **Just this one container** (if you have Docker but run FreeStream with `npm start`):
+  ```sh
+  docker compose up -d flaresolverr
+  # or, outside this repo:
+  docker run -d --name flaresolverr --restart unless-stopped -p 127.0.0.1:8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+  ```
+- **Windows or Linux (x64):** download the build for your system from [FlareSolverr's releases](https://github.com/FlareSolverr/FlareSolverr/releases), unpack it, and run `flaresolverr`. It includes its own Chrome.
+- **macOS, or anywhere from source:** install Google Chrome and Python 3, then:
+  ```sh
+  git clone https://github.com/FlareSolverr/FlareSolverr.git && cd FlareSolverr
+  python3 -m venv .venv && . .venv/bin/activate
+  pip install -r requirements.txt
+  python src/flaresolverr.py
+  ```
+  Keep it running while you use FreeStream; FlareSolverr's README lists the Python versions it supports.
+
+### 2. Point Prowlarr (or Jackett) at it
+
+**Prowlarr:**
+1. **Settings → Indexers → Indexer Proxies → +** and choose **FlareSolverr**.
+2. **Tags:** `flaresolverr`. **Host:** `http://flaresolverr:8191` with Docker, or `http://localhost:8191` without. Leave the timeout at 60 seconds.
+3. Press **Test**, then **Save**.
+4. Open each Cloudflare-protected indexer (**Indexers** → the indexer → edit), add the tag `flaresolverr`, and save. Prowlarr marks these as blocked by Cloudflare when you test them, and under **System → Status**.
+
+Only indexers with the tag go through FlareSolverr; the rest connect directly as before.
+
+**Jackett:** on the dashboard, set **FlareSolverr API URL** to `http://localhost:8191` and press **Apply server settings**. Jackett uses it for any indexer that hits a Cloudflare check.
+
+### Good to know
+
+- The first search on a protected indexer takes 5–20 seconds longer while the check is passed.
+- It gets past Cloudflare's automatic check, not sites that ask you to solve a CAPTCHA.
+- FlareSolverr can break for a while when Cloudflare changes its checks. [Byparr](https://github.com/ThePhaseless/Byparr) is a drop-in replacement: same port, same Prowlarr setting. In `docker-compose.yml`, swap the image for `ghcr.io/thephaseless/byparr:latest`.
+- Headless Chrome uses roughly 200–500 MB of memory while it works.
 
 ## Watching on an LG TV
 

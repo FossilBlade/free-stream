@@ -1,8 +1,7 @@
-# Starts FreeStream + Prowlarr (and optionally FlareSolverr).
+# Starts FreeStream, Prowlarr and FlareSolverr (gets Prowlarr past Cloudflare's browser check).
 #
-#   docker compose up -d --build              # everything
-#   docker compose up -d prowlarr             # only Prowlarr (if you run FreeStream with `npm start`)
-#   docker compose --profile flaresolverr up -d   # also start FlareSolverr (for Cloudflare-protected indexers)
+#   docker compose up -d --build                       # everything
+#   docker compose up -d prowlarr flaresolverr         # only the helpers (if you run FreeStream with `npm start`)
 #
 # All state lives in ./data (FreeStream settings/progress in ./data, Prowlarr in ./data/prowlarr).
 # Downloads are cached in ~/Movies/FreeStream on the Mac.
@@ -57,13 +56,18 @@ services:
       - "9696:9696"
     volumes:
       - ./data/prowlarr:/config
+    depends_on:
+      - flaresolverr
 
+  # Opens Cloudflare-protected indexer pages in a headless browser and hands the cookies back to Prowlarr.
+  # Prowlarr reaches it at http://flaresolverr:8191, and uses it only for indexers tagged "flaresolverr".
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
     container_name: flaresolverr
     restart: unless-stopped
-    profiles: ["flaresolverr"]
     environment:
       TZ: ${TZ:-UTC}
+      LOG_LEVEL: info
     ports:
-      - "8191:8191"
+      # This computer only: a Prowlarr running outside Docker can use it, other devices on the network can't.
+      - "127.0.0.1:8191:8191"
