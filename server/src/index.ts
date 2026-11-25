@@ -9,7 +9,7 @@ import { markNotInterested, moreLikeThis, rebuild, startSuggestions, suggestedBe
 import { remoteDefaults, testJudge } from './llm.ts';
 import { guessTitle, parseRelease } from './release.ts';
 import { deepCheck, getVerdict, hasFfmpeg, setSelfBaseUrl, verdictForHash } from './verify.ts';
-import { addWatch, autoSource, followKey, markSeen, removeWatch, startWatcher, watchKey } from './watcher.ts';
+import { addWatch, autoSeasonPack, autoSource, followKey, kickWatcher, markSeen, removeWatch, startWatcher, watchKey } from './watcher.ts';
 import type { Torrent } from 'webtorrent';
 import {
   adultsOnly,
@@ -63,7 +63,9 @@ import {
   finishedFilePath,
   folderName,
   getTorrent,
-  hasEpisodeDownload,
+  claimEpisodeDownload,
+  completeFile,
+  episodeFile,
   markPlayed,
   migrateLegacyFolders,
   prewarm,
@@ -537,8 +539,10 @@ app.post('/api/play', async (req, res) => {
   const season = optInt(b.season, 'season');
   const episode = optInt(b.episode, 'episode');
   await requireAllowed(res, type, tmdbId);
-  // Kids just press Play: FreeStream picks a verified source itself (never a theater copy).
-  const source = isKid(res) ? await autoSource(type, tmdbId, season, episode) : b.source || sourceFor(type, tmdbId, season, episode);
+  // A finished download plays from disk, whatever source is remembered. Otherwise: kids just press Play
+  // and FreeStream picks a verified source itself (never a theater copy); adults get the remembered one.
+  const local = b.source ? null : completeFile(type, tmdbId, season, episode);
+  const source = local ? { infoHash: local.infoHash, releaseTitle: local.name } : isKid(res) ? await autoSource(type, tmdbId, season, episode) : b.source || sourceFor(type, tmdbId, season, episode);
   if (!source) throw new HttpError(409, isKid(res) ? 'This one isn’t ready yet — ask a grown-up to set it up.' : 'No source chosen yet.');
 
   const t = await addSource(source, await titleFor(type, tmdbId));
@@ -583,13 +587,20 @@ app.delete('/api/preview/:hash', async (req, res) => {
 
 /** Download button: fetch the whole file in the background without playing it. */
 app.post('/api/download', adultsOnly, async (req, res) => {
-  const b = req.body as { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource };
+  const b = req.body as { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource; auto?: boolean };
   const type = mediaType(b.mediaType);
   const tmdbId = int(b.tmdbId, 'tmdbId');
   const season = optInt(b.season, 'season');
   const episode = optInt(b.episode, 'episode');
   const source = b.source || sourceFor(type, tmdbId, season, episode);
-  if (!source) throw new HttpError(409, 'No source chosen yet.');
+  if (!source) {
+    // Nothing chosen yet: find, check and download the best source in the background (see Watching).
+    if (!b.auto) throw new HttpError(409, 'No source chosen yet.');
+    if (type === 'tv' && (season == null || episode == null)) throw new HttpError(400, 'season and episode are required');
+    if (type === 'tv' && claimEpisodeDownload(tmdbId, season!, episode!)) return void res.json({ status: 'already-complete', fileName: `S${season}E${episode}` });
+    await addWatch({ mediaType: type, tmdbId, season, episode, reason: 'release', download: true });
+    return void res.json({ status: 'searching', fileName: '' });
+  }
 
   const t = await addSource(source, await titleFor(type, tmdbId));
   const fileIdx = pickFile(t, season, episode);
@@ -599,21 +610,6 @@ app.post('/api/download', adultsOnly, async (req, res) => {
   save();
   res.json({ status, infoHash: t.infoHash, fileIdx, fileName: t.files[fileIdx].name });
 });
-
-/**
- * The file for one episode, or null when this torrent doesn't have it. `strict` also requires the
- * file to be named as that episode, so a single unnamed video isn't taken for every episode.
- */
-function episodeFile(t: Torrent, season: number, episode: number, strict: boolean): number | null {
-  try {
-    const idx = pickFile(t, season, episode);
-    if (!strict) return idx;
-    const named = episodeOf(t.files[idx].path);
-    return named && named.s === season && named.e === episode ? idx : null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Several episodes at once (Download season, Rest of season, or picked episodes). Each comes from the
@@ -629,7 +625,7 @@ app.post('/api/download/episodes', adultsOnly, async (req, res) => {
   const wanted = [...new Set(b.episodes.map((e) => int(e, 'episode')))].sort((x, y) => x - y);
   const title = await titleFor('tv', tmdbId);
 
-  const already = wanted.filter((e) => hasEpisodeDownload(tmdbId, season, e));
+  const already = wanted.filter((e) => claimEpisodeDownload(tmdbId, season, e));
   let todo = wanted.filter((e) => !already.includes(e));
   const started: number[] = [];
   let size = 0;
@@ -674,8 +670,36 @@ app.post('/api/download/episodes', adultsOnly, async (req, res) => {
     }
   }
 
-  // 3. No source yet: find, check and download one for each in the background.
+  // 3. No source yet: find, check and download one for each in the background. With several to find,
+  //    try a season pack first; the episodes it doesn't have are then found one by one.
   for (const e of todo) await addWatch({ mediaType: 'tv', tmdbId, season, episode: e, reason: 'release', download: true });
+  const packSearch = !b.source && todo.length > 1;
+  if (packSearch) {
+    const keys = todo.map((e) => watchKey('tv', tmdbId, season, e));
+    for (const k of keys) {
+      const w = db.watches[k];
+      if (w?.status !== 'waiting') continue;
+      w.nextCheck = Date.now() + 30 * 60 * 1000; // released below once the pack search is over
+      w.note = 'Looking for a season pack first…';
+    }
+    const release = (from: number[]) => {
+      for (const k of keys) {
+        const w = db.watches[k];
+        if (!w || w.status !== 'waiting' || w.note !== 'Looking for a season pack first…') continue;
+        if (from.includes(w.episode!)) delete db.watches[k];
+        else {
+          w.nextCheck = Date.now();
+          w.note = 'Finding a source to download…';
+        }
+      }
+      save();
+      kickWatcher();
+    };
+    autoSeasonPack(tmdbId, season, [...todo]).then(release, (e) => {
+      console.error(`[download] season pack search failed:`, (e as Error).message);
+      release([]);
+    });
+  }
 
   // 4. New episodes, as they air (from the first one that isn't out yet).
   if (b.follow) {
@@ -687,7 +711,7 @@ app.post('/api/download/episodes', adultsOnly, async (req, res) => {
   }
   save();
   if (started.length) console.log(`[download] ${title.title || tmdbId}: S${season} episodes ${started.join(', ')}`);
-  res.json({ started, already: already.sort((x, y) => x - y), searching: todo, following: !!b.follow, size });
+  res.json({ started, already: already.sort((x, y) => x - y), searching: todo, packSearch, following: !!b.follow, size });
 });
 
 /** Title page opened: connect to the remembered source's peers now, so Play starts faster. */
@@ -920,8 +944,15 @@ app.get('/api/downloads/:hash/file', adultsOnly, (req, res) => {
 
 app.delete('/api/downloads/:hash', adultsOnly, async (req, res) => {
   const file = optInt(req.query.file, 'file');
-  if (file != null) await deleteDownloadFile(hash(req.params.hash), file);
-  else await deleteDownload(hash(req.params.hash));
+  const h = hash(req.params.hash);
+  // Deleted on purpose: drop the download watch that started it, so it isn't started again.
+  const item = file != null ? db.downloads[h]?.items?.[file] : undefined;
+  for (const w of Object.values(db.watches)) {
+    if (!w.downloaded || w.found?.source.infoHash !== h) continue;
+    if (file == null || (w.season === item?.season && w.episode === item?.episode)) delete db.watches[w.key];
+  }
+  if (file != null) await deleteDownloadFile(h, file);
+  else await deleteDownload(h);
   res.json({ ok: true });
 });
 

@@ -14,7 +14,7 @@ import { judge } from './llm.ts';
 import { parseRelease } from './release.ts';
 import { db, getSettings, save, type MediaType, type SavedSource, type Verdict } from './store.ts';
 import * as tmdb from './tmdb.ts';
-import { addSource, busyTorrents, discardPreview, folderName, isStreaming, pickFile, VIDEO_EXT } from './torrents.ts';
+import { addSource, busyTorrents, folderName, pickFile, VIDEO_EXT } from './torrents.ts';
 
 let selfBaseUrl = 'http://127.0.0.1:8080';
 export const setSelfBaseUrl = (url: string) => (selfBaseUrl = url);
@@ -321,7 +321,7 @@ async function runCheck(req: CheckRequest): Promise<Verdict> {
     return verdict;
   } finally {
     busyTorrents.delete(t.infoHash);
-    // Checked but never played: don't leave it in the cache (unless someone is previewing it right now).
-    if (db.downloads[t.infoHash]?.previewOnly && !isStreaming(t.infoHash)) discardPreview(t.infoHash).catch(() => {});
+    // Checked but never played: the housekeeping deletes it once it's been unused for a few minutes.
+    // Not right away: a check is usually followed straight away by a download or Play of the same torrent.
   }
 }

@@ -1,5 +1,5 @@
 import { setFocus } from '@noriginmedia/norigin-spatial-navigation';
-import { Bell, BellRing, CalendarClock, Check, CheckCircle2, CheckSquare, Clapperboard, Download, Link2, ListChecks, ListPlus, ListVideo, Play, Search, Sparkles, Square, Star, ThumbsDown, X } from 'lucide-react';
+import { Bell, BellRing, CalendarClock, Check, CheckCircle2, CheckSquare, Clapperboard, Download, Layers, Link2, ListChecks, ListPlus, ListVideo, Play, Search, Sparkles, Square, Star, ThumbsDown, X } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, ApiError, batchMessage, downloadMessage, formatRuntime, img, shortDate, todayIso, type Card, type Details, type DownloadRow, type Episode, type MediaType, type Progress, type SavedSource, type Verdict, type Watch } from '../api';
@@ -246,16 +246,31 @@ export function Title() {
     }
   }, [details, params, playMain, openPicker]);
 
-  /** Download: uses the remembered source (or the given one); otherwise opens the list to pick one. */
+  /** Download: the given or remembered source; with neither, the server finds the best one itself. */
   const download = async (t: Target, source?: SavedSource) => {
     try {
-      const r = await api.download({ mediaType: type, tmdbId: id, season: t.season, episode: t.episode, source });
+      const r = await api.download({ mediaType: type, tmdbId: id, season: t.season, episode: t.episode, source, auto: !source });
       toast(downloadMessage(r));
       refreshDownloads();
+      if (r.status === 'searching' && type === 'tv' && t.season != null) loadSeason(t.season, true);
     } catch (e) {
       const err = e as ApiError;
+      // A remembered season pack that lacks this episode: show the list for it.
       if (err.status === 409 || err.status === 422) openPicker(t, 'download');
       else toast(err.message, 'error');
+    }
+  };
+
+  /** Several episodes in one click: remembered sources, else a season pack or each episode found automatically. */
+  const downloadBatch = async (eps: number[], airing: boolean) => {
+    if (season == null || !eps.length) return;
+    setSelecting(null);
+    try {
+      toast(batchMessage(await api.downloadEpisodes({ tmdbId: id, season, episodes: eps, follow: airing })));
+      loadSeason(season, true);
+      refreshDownloads();
+    } catch (e) {
+      toast((e as ApiError).message, 'error');
     }
   };
 
@@ -539,7 +554,7 @@ export function Title() {
             <FocusGroup focusKey="season-actions" className="actions actions-tight season-actions">
               {selecting ? (
                 <>
-                  <Button variant="primary" icon={<Download />} disabled={!selecting.length} onSelect={() => openBatch(selecting, 'Picked episodes', airing)}>
+                  <Button variant="primary" icon={<Download />} disabled={!selecting.length} onSelect={() => downloadBatch(selecting, airing)}>
                     {selecting.length ? `Download ${selecting.length} episode${selecting.length === 1 ? '' : 's'}` : 'Pick episodes below'}
                   </Button>
                   <Button icon={<ListChecks />} onSelect={() => setSelecting(selecting.length === seasonTodo.length ? [] : seasonTodo)}>
@@ -552,7 +567,7 @@ export function Title() {
               ) : (
                 <>
                   {seasonTodo.length > 0 ? (
-                    <Button icon={<Download />} onSelect={() => openBatch(seasonTodo, 'Whole season', airing)}>
+                    <Button icon={<Download />} onSelect={() => downloadBatch(seasonTodo, airing)}>
                       Download season
                     </Button>
                   ) : airing && !follow ? (
@@ -565,8 +580,13 @@ export function Title() {
                     </Button>
                   ) : null}
                   {showRest && (
-                    <Button icon={<Download />} onSelect={() => openBatch(restTodo, `From episode ${restFrom}`, airing)}>
+                    <Button icon={<Download />} onSelect={() => downloadBatch(restTodo, airing)}>
                       Rest of season
+                    </Button>
+                  )}
+                  {seasonTodo.length > 1 && (
+                    <Button variant="ghost" icon={<Layers />} onSelect={() => openBatch(seasonTodo, 'Whole season', airing)}>
+                      Choose a season pack
                     </Button>
                   )}
                   {seasonTodo.length > 1 && (

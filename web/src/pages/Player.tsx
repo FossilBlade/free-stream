@@ -810,6 +810,10 @@ export function Player() {
                 ? pickNote || 'Finding peers and fetching the file list…'
                 : !mode
                   ? 'Checking the file format…'
+                  : status && status.progress >= 1
+                  ? converting
+                    ? 'Converting for this device…'
+                    : 'Loading from this Mac…'
                   : status
                   ? `Buffering · ${status.peers} peer${status.peers === 1 ? '' : 's'} · ${formatBytes(status.downloadSpeed)}/s`
                   : 'Buffering…'

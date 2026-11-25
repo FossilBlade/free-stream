@@ -10,6 +10,10 @@ export const SUB_EXT = new Set(['.srt', '.vtt']);
 
 /** How long a torrent with no viewers keeps running before it is stopped (files stay cached on disk). */
 const IDLE_MS = 15 * 60 * 1000;
+/** A source opened only to check or preview it is deleted after this long unused. */
+const PREVIEW_KEEP_MS = 10 * 60 * 1000;
+/** Torrents being deleted right now; adding one of them again waits until that's finished. */
+const discarding = new Map<string, Promise<void>>();
 const METADATA_TIMEOUT_MS = 90 * 1000;
 
 /** Extra public trackers help magnet links with few or dead trackers find peers. */
@@ -149,6 +153,7 @@ export async function addSource(
   opts: { preview?: boolean; folder?: string; title?: string; mediaType?: MediaType; tmdbId?: number } = {},
 ): Promise<Torrent> {
   if (src.infoHash) {
+    await discarding.get(src.infoHash);
     const existing = await client.get(src.infoHash);
     if (existing) return waitForMetadata(existing);
   }
@@ -156,7 +161,15 @@ export async function addSource(
   // Reopening a torrent we've seen: load its saved .torrent file instead of re-fetching metadata from peers.
   const cachedMeta = src.infoHash ? readTorrentFile(src.infoHash) : undefined;
   let id: string | Buffer | undefined = cachedMeta || src.magnet;
-  if (!id && src.downloadUrl) id = await resolveDownloadUrl(src.downloadUrl);
+  if (!id && src.downloadUrl) {
+    try {
+      id = await resolveDownloadUrl(src.downloadUrl);
+    } catch (e) {
+      // The indexer is down or slow: with the info hash, peers can still be found directly (DHT).
+      if (!src.infoHash) throw e;
+      console.log(`[torrent] ${src.infoHash}: indexer didn't answer (${(e as Error).message}) — finding peers by info hash instead`);
+    }
+  }
   if (!id && src.infoHash) id = db.downloads[src.infoHash]?.magnet || `magnet:?xt=urn:btih:${src.infoHash}`;
   if (!id) throw new TorrentError('No magnet link or torrent file given.', 400);
 
@@ -167,6 +180,7 @@ export async function addSource(
     throw new TorrentError('That does not look like a valid magnet link or torrent file.', 400);
   }
 
+  await discarding.get(infoHash);
   const existing = await client.get(infoHash);
   if (existing) return waitForMetadata(existing);
 
@@ -608,9 +622,78 @@ export async function deleteDownloadFile(infoHash: string, fileIdx: number): Pro
 export async function discardPreview(infoHash: string): Promise<boolean> {
   // Preview streams may still be closing; nobody is really watching a preview-only torrent
   // ("Watch this" clears the flag first), so it's safe to drop it now.
-  if (!db.downloads[infoHash]?.previewOnly || busyTorrents.has(infoHash)) return false;
-  await deleteDownload(infoHash);
+  if (!db.downloads[infoHash]?.previewOnly || busyTorrents.has(infoHash) || discarding.has(infoHash)) return false;
+  // Anyone adding this torrent meanwhile (a download or Play starting) waits until it's gone, then
+  // starts afresh: otherwise the deletion would wipe out what they just started.
+  const done = deleteDownload(infoHash).finally(() => discarding.delete(infoHash));
+  discarding.set(infoHash, done);
+  await done;
   return true;
+}
+
+/**
+ * True when this episode is downloaded or downloading. A copy that's complete only because it was
+ * streamed counts too, and is kept from now on, so the cache limit can't delete it later.
+ */
+export function claimEpisodeDownload(tmdbId: number, season: number, episode: number): boolean {
+  let found = false;
+  for (const d of Object.values(db.downloads)) {
+    if (d.mediaType !== 'tv' || d.tmdbId !== tmdbId) continue;
+    for (const it of Object.values(d.items || {})) {
+      if (it.season !== season || it.episode !== episode) continue;
+      if (it.downloading) found = true;
+      else if (it.progress >= 1) {
+        found = true;
+        if (!it.requested) {
+          it.requested = true;
+          d.kept = true;
+          save();
+        }
+      }
+    }
+  }
+  return found;
+}
+
+/** A finished copy of this movie or episode on this Mac, if there is one (played from disk, no peers needed). */
+export function completeFile(mediaType: MediaType, tmdbId: number, season?: number, episode?: number): { infoHash: string; fileIdx: number; name: string } | null {
+  for (const d of Object.values(db.downloads)) {
+    if (d.mediaType !== mediaType || d.tmdbId !== tmdbId) continue;
+    for (const it of Object.values(d.items || {})) {
+      if (mediaType === 'tv' && (it.season !== season || it.episode !== episode)) continue;
+      if (it.progress >= 1) return { infoHash: d.infoHash, fileIdx: it.fileIdx, name: d.name || it.path };
+    }
+  }
+  return null;
+}
+
+/** Where a requested download of this title (or episode) stands: finished, still going, or not there. */
+export function downloadState(mediaType: MediaType, tmdbId: number, season?: number, episode?: number): 'done' | 'downloading' | null {
+  let state: 'done' | 'downloading' | null = null;
+  for (const d of Object.values(db.downloads)) {
+    if (d.mediaType !== mediaType || d.tmdbId !== tmdbId) continue;
+    for (const it of Object.values(d.items || {})) {
+      if (mediaType === 'tv' && (it.season !== season || it.episode !== episode)) continue;
+      if (it.progress >= 1) return 'done';
+      if (it.downloading) state = 'downloading';
+    }
+  }
+  return state;
+}
+
+/**
+ * The file for one episode, or null when this torrent doesn't have it. `strict` also requires the
+ * file to be named as that episode, so a single unnamed video isn't taken for every episode.
+ */
+export function episodeFile(t: Torrent, season: number, episode: number, strict: boolean): number | null {
+  try {
+    const idx = pickFile(t, season, episode);
+    if (!strict) return idx;
+    const named = episodeOf(t.files[idx].path);
+    return named && named.s === season && named.e === episode ? idx : null;
+  } catch {
+    return null;
+  }
 }
 
 export function markPlayed(infoHash: string): void {
@@ -627,7 +710,7 @@ export function markPlayed(infoHash: string): void {
 async function stopIdle(): Promise<void> {
   const now = Date.now();
   for (const d of Object.values(db.downloads)) {
-    if (d.previewOnly && now - d.lastAccess > 60 * 60 * 1000) await discardPreview(d.infoHash);
+    if (d.previewOnly && now - d.lastAccess > PREVIEW_KEEP_MS) await discardPreview(d.infoHash);
   }
   for (const t of [...client.torrents]) {
     const d = db.downloads[t.infoHash];

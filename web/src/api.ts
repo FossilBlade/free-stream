@@ -414,8 +414,9 @@ export const api = {
   removeFromList: (type: MediaType, id: number) => request('DELETE', `/list/${type}/${id}`),
   downloads: (filter?: { type: MediaType; id: number }) => get<{ downloads: DownloadRow[]; cacheLimitGb: number }>(`/downloads?${qs(filter || {})}`),
   deleteDownload: (hash: string, fileIdx?: number | null) => request('DELETE', `/downloads/${hash}?${qs({ file: fileIdx ?? undefined })}`),
-  download: (b: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource }) =>
-    request<{ status: 'started' | 'already-downloading' | 'already-complete'; infoHash: string; fileIdx: number; fileName: string }>('POST', '/download', b),
+  /** With `auto` and nothing chosen yet, the server finds, checks and downloads the best source in the background. */
+  download: (b: { mediaType: MediaType; tmdbId: number; season?: number; episode?: number; source?: SavedSource; auto?: boolean }) =>
+    request<{ status: 'started' | 'already-downloading' | 'already-complete' | 'searching'; infoHash?: string; fileIdx?: number; fileName: string }>('POST', '/download', b),
   /** Several episodes of a season: from the season pack given, else remembered sources, else found in the background. */
   downloadEpisodes: (b: { tmdbId: number; season: number; episodes: number[]; source?: SavedSource; follow?: boolean }) => request<BatchDownload>('POST', '/download/episodes', b),
   keep: (hash: string, kept: boolean) => request('POST', `/downloads/${hash}/keep`, { kept }),
@@ -441,6 +442,7 @@ export const saveFileUrl = (hash: string, fileIdx: number) => `/api/downloads/${
 
 /** Toast text for the result of pressing Download. */
 export function downloadMessage(r: { status: string; fileName: string }): string {
+  if (r.status === 'searching') return 'Finding the best source — it starts downloading by itself (progress under Watching, then Downloads).';
   if (r.status === 'already-complete') return `${r.fileName} is already downloaded.`;
   if (r.status === 'already-downloading') return `${r.fileName} is already downloading.`;
   return `Downloading ${r.fileName} — progress is on the Downloads page.`;
@@ -451,6 +453,8 @@ export interface BatchDownload {
   already: number[];
   /** No source yet: being found in the background (shown under Watching). */
   searching: number[];
+  /** Several to find: a season pack is tried first, then each episode. */
+  packSearch?: boolean;
   following: boolean;
   size: number;
 }
@@ -465,7 +469,12 @@ function episodeList(eps: number[]): string {
 export function batchMessage(r: BatchDownload): string {
   const parts: string[] = [];
   if (r.started.length) parts.push(`Downloading ${r.started.length} episode${r.started.length === 1 ? '' : 's'} (${formatBytes(r.size)})`);
-  if (r.searching.length) parts.push(`finding sources for ${episodeList(r.searching)} in the background (see Watching)`);
+  if (r.searching.length)
+    parts.push(
+      r.packSearch
+        ? `finding a season pack (or else each episode) for ${episodeList(r.searching)} in the background (see Watching)`
+        : `finding a source for ${episodeList(r.searching)} in the background (see Watching)`,
+    );
   if (r.following) parts.push('new episodes will download as they air');
   if (!parts.length) return r.already.length ? 'Those episodes are already downloaded.' : 'Nothing to download.';
   const text = parts.join('; ');

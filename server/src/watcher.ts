@@ -10,7 +10,7 @@ import { searchReleases, type Release } from './indexers.ts';
 import { parseRelease } from './release.ts';
 import { db, episodeSourceKey, getSettings, rememberSource, save, sourceFor, type MediaType, type SavedSource, type Watch } from './store.ts';
 import * as tmdb from './tmdb.ts';
-import { addSource, hasEpisodeDownload, pickFile, startDownload } from './torrents.ts';
+import { addSource, claimEpisodeDownload, downloadState, episodeFile, pickFile, startDownload } from './torrents.ts';
 import { deepCheck, verdictForHash } from './verify.ts';
 
 const HOUR = 3600 * 1000;
@@ -64,7 +64,7 @@ export async function addWatch(p: { mediaType: MediaType; tmdbId: number; season
   };
   db.watches[key] = w;
   save();
-  setTimeout(tick, 2000); // don't wait for the next interval
+  kickWatcher(); // don't wait for the next interval
   return w;
 }
 
@@ -127,7 +127,7 @@ async function followSeason(w: Watch): Promise<void> {
   for (const e of list) {
     if (e.number < (w.fromEpisode ?? 1)) continue;
     if (!e.airDate || e.airDate > today) break;
-    if (!hasEpisodeDownload(w.tmdbId, season, e.number)) {
+    if (!claimEpisodeDownload(w.tmdbId, season, e.number)) {
       await addWatch({ mediaType: 'tv', tmdbId: w.tmdbId, season, episode: e.number, reason: 'release', download: true });
       console.log(`[watch] ${w.title}: S${season}E${e.number} is out — finding a source`);
     }
@@ -157,7 +157,7 @@ async function process(w: Watch): Promise<void> {
   w.checks++;
   if (w.reason === 'follow') return followSeason(w);
   // Asked to download an episode that's since been downloaded some other way: nothing left to do.
-  if (w.download && w.season != null && w.episode != null && hasEpisodeDownload(w.tmdbId, w.season, w.episode)) {
+  if (w.download && w.season != null && w.episode != null && claimEpisodeDownload(w.tmdbId, w.season, w.episode)) {
     delete db.watches[w.key];
     return;
   }
@@ -210,11 +210,37 @@ async function process(w: Watch): Promise<void> {
   schedule(w, age < 7 * DAY ? 6 * HOUR : DAY, candidates.length ? 'Sources found but none verified yet — will check again' : 'No proper release yet — will check again');
 }
 
+/**
+ * Watches whose find has been downloaded: once the download is finished there's nothing left to show
+ * under Watching, so they're removed. One whose download has gone (stopped or deleted by mistake)
+ * starts it again from the source it found.
+ */
+async function tidyDownloaded(): Promise<void> {
+  for (const w of Object.values(db.watches)) {
+    if (w.status !== 'found' || !w.downloaded || !w.found || w.reason === 'follow') continue;
+    const state = downloadState(w.mediaType, w.tmdbId, w.season, w.episode);
+    if (state === 'done') {
+      delete db.watches[w.key];
+      console.log(`[watch] ${w.title}${w.episode != null ? ` S${w.season}E${w.episode}` : ''}: downloaded — done`);
+    } else if (!state) {
+      console.log(`[watch] ${w.title}${w.episode != null ? ` S${w.season}E${w.episode}` : ''}: its download is gone — starting it again`);
+      await downloadFound(w).catch((e) => console.error(`[watch] ${w.title}: couldn't restart the download:`, (e as Error).message));
+    }
+  }
+  save();
+}
+
+/** Starts the watcher's next round now (soon), instead of waiting for the interval. */
+export function kickWatcher(): void {
+  setTimeout(tick, 2000);
+}
+
 let running = false;
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
   try {
+    await tidyDownloaded();
     // A few rounds, so watches added meanwhile (a batch download, a followed season's new episode) start now.
     for (let round = 0; round < 5; round++) {
       const due = Object.values(db.watches).filter((w) => w.status === 'waiting' && w.nextCheck <= Date.now());
@@ -238,6 +264,44 @@ async function tick(): Promise<void> {
 export function startWatcher(): void {
   setInterval(tick, 5 * 60 * 1000).unref();
   setTimeout(tick, 30 * 1000);
+}
+
+/**
+ * A batch download with no source chosen: look for a season pack first (one torrent for all of it is
+ * faster and more reliable than one per episode). Takes the best-ranked packs for this season, checks
+ * each against the first wanted episode, and starts every wanted episode the first good one has.
+ * Returns the episodes it started; the caller finds the rest one by one.
+ */
+export async function autoSeasonPack(tmdbId: number, season: number, episodes: number[]): Promise<number[]> {
+  if (!episodes.length) return [];
+  const d = await tmdb.details('tv', tmdbId);
+  const found = await searchReleases({ mediaType: 'tv', title: d.title, year: d.year, season, runtime: d.runtime });
+  const packs = preferenceOrder(found.releases.filter((r) => r.info.pack && (r.info.season == null || r.info.season === season))).slice(0, 2);
+  for (const r of packs) {
+    const source: SavedSource = { magnet: r.magnet, downloadUrl: r.downloadUrl, infoHash: r.infoHash, releaseTitle: r.title };
+    try {
+      const v = await deepCheck({ source, mediaType: 'tv', tmdbId, season, episode: episodes[0], release: { size: r.size, seeders: r.seeders, indexer: r.indexer } });
+      if (v.outcome !== 'verified') continue;
+      const chosen = { ...source, infoHash: v.infoHash };
+      const t = await addSource(chosen, { mediaType: 'tv', tmdbId, title: d.year ? `${d.title} (${d.year})` : d.title });
+      const started: number[] = [];
+      for (const e of episodes) {
+        const idx = episodeFile(t, season, e, true);
+        if (idx == null) continue;
+        startDownload(t, idx, { season, episode: e });
+        rememberSource('tv', tmdbId, chosen, { season, episode: e, seasonPack: true });
+        started.push(e);
+      }
+      save();
+      if (!started.length) continue;
+      console.log(`[watch] ${d.title}: season ${season} pack ${r.title} — downloading episodes ${started.join(', ')}`);
+      return started;
+    } catch (e) {
+      console.error(`[watch] ${d.title}: couldn't use season pack ${r.title}:`, (e as Error).message);
+    }
+  }
+  console.log(`[watch] ${d.title}: no good season ${season} pack — finding each episode instead`);
+  return [];
 }
 
 /**
