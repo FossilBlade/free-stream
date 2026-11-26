@@ -1,5 +1,6 @@
 import type { NavigateFunction } from 'react-router-dom';
 import { api, ApiError, type MediaType } from '../api';
+import { enterLandscape, leaveLandscape } from '../landscape';
 import { toast } from './Toast';
 
 /** Plays a specific downloaded/cached torrent for a title (and episode), then opens the player. */
@@ -13,6 +14,7 @@ export async function playDownload(
   }
   const season = d.season ?? undefined;
   const episode = d.episode ?? undefined;
+  enterLandscape(); // needs the tap, so before waiting for the server
   try {
     const info = await api.play({
       mediaType: d.mediaType,
@@ -24,6 +26,7 @@ export async function playDownload(
     const q = d.mediaType === 'tv' && season != null ? `?season=${season}&episode=${episode}` : '';
     navigate(`/watch/${d.mediaType}/${d.tmdbId}${q}`, { state: { play: info } });
   } catch (e) {
+    leaveLandscape();
     toast((e as ApiError).message, 'error');
   }
 }

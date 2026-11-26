@@ -18,6 +18,7 @@ import {
   supportsAudioTracks,
   type PlayMode,
 } from '../playback';
+import { canLandscape, enterLandscape, isFullscreen, leaveLandscape } from '../landscape';
 import { useProfile } from '../profile';
 import { isBackKey, isTV, KEY } from '../tv';
 
@@ -207,6 +208,12 @@ export function Player() {
       setFatal({ message: (e as ApiError).message, canChangeSource: true });
     }
   };
+
+  // Phones: fullscreen landscape for as long as the player is open (next episodes included).
+  useEffect(() => {
+    enterLandscape();
+    return leaveLandscape;
+  }, []);
 
   // ---- load the stream (from the title page's state, or by asking the server) -------------------
   useEffect(() => {
@@ -485,6 +492,7 @@ export function Player() {
   }, [navigate, type, id, season, episode]);
 
   const toggleFullscreen = useCallback(() => {
+    if (canLandscape()) return isFullscreen() ? leaveLandscape() : enterLandscape();
     const d = document as Document & { webkitFullscreenElement?: Element; webkitExitFullscreen?: () => void };
     const el = document.documentElement as HTMLElement & { webkitRequestFullscreen?: () => void };
     if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen ? d.exitFullscreen() : d.webkitExitFullscreen?.());
@@ -758,7 +766,9 @@ export function Player() {
           playsInline
           muted={muted}
           onClick={() => {
-            togglePlay();
+            // Phone, no longer fullscreen (system Back, or opened without a tap): the tap brings it back.
+            if (canLandscape() && !isFullscreen()) enterLandscape();
+            else togglePlay();
             poke();
           }}
           onDoubleClick={toggleFullscreen}

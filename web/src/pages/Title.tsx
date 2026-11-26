@@ -12,6 +12,7 @@ import { toast } from '../components/Toast';
 import { VerdictCard } from '../components/VerdictCard';
 import { Button, hideBroken, ProgressBar, Spinner } from '../components/ui';
 import { SetupNeeded } from './Home';
+import { enterLandscape, leaveLandscape } from '../landscape';
 import { useProfile } from '../profile';
 
 interface Target {
@@ -179,6 +180,7 @@ export function Title() {
   const play = useCallback(
     async (t: Target, source?: SavedSource) => {
       if (!details) return;
+      enterLandscape(); // needs the tap, so before waiting for the server
       setBusy(true);
       try {
         const info = await api.play({ mediaType: type, tmdbId: id, season: t.season, episode: t.episode, source });
@@ -187,13 +189,17 @@ export function Title() {
       } catch (e) {
         const err = e as ApiError;
         // Kids never see source lists: just say what happened.
-        if (isKid) return void toast(err.message, 'error');
+        if (isKid) {
+          leaveLandscape();
+          return void toast(err.message, 'error');
+        }
         // No source yet / not in this season pack: the player picks the best one itself.
         if (!source && (err.status === 409 || err.status === 422)) {
           const q = type === 'tv' ? `?season=${t.season}&episode=${t.episode}` : '';
           return void navigate(`/watch/${type}/${id}${q}`);
         }
         // A chosen source that failed: say why and show the list again.
+        leaveLandscape();
         if (err.status !== 409 && err.status !== 422) toast(err.message, 'error');
         openPicker(t, 'play');
       } finally {
